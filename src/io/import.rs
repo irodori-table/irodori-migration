@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{dialect_uses_backslash_escapes, sql_string_literal, OwnedCell};
 
+const DEFAULT_MAX_PREVIEW_ROWS: usize = 100;
+const DEFAULT_MAX_SCAN_ROWS: usize = 10_000;
+const DEFAULT_MAX_JSON_SCAN_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferredColumn {
     pub name: String,
@@ -61,11 +65,34 @@ impl ImportPreview {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportPreviewOptions {
     pub max_rows: usize,
+    pub max_scan_rows: usize,
+    pub max_scan_bytes: usize,
 }
 
 impl Default for ImportPreviewOptions {
     fn default() -> Self {
-        Self { max_rows: 100 }
+        Self {
+            max_rows: DEFAULT_MAX_PREVIEW_ROWS,
+            max_scan_rows: DEFAULT_MAX_SCAN_ROWS,
+            max_scan_bytes: DEFAULT_MAX_JSON_SCAN_BYTES,
+        }
+    }
+}
+
+impl ImportPreviewOptions {
+    pub fn with_max_rows(mut self, max_rows: usize) -> Self {
+        self.max_rows = max_rows;
+        self
+    }
+
+    pub fn with_max_scan_rows(mut self, max_scan_rows: usize) -> Self {
+        self.max_scan_rows = max_scan_rows;
+        self
+    }
+
+    pub fn with_max_scan_bytes(mut self, max_scan_bytes: usize) -> Self {
+        self.max_scan_bytes = max_scan_bytes;
+        self
     }
 }
 
@@ -111,6 +138,15 @@ impl DelimitedImportOptions {
 }
 
 pub fn preview_json(input: &str, options: ImportPreviewOptions) -> io::Result<ImportPreview> {
+    if input.len() > options.max_scan_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "JSON preview input exceeds max_scan_bytes ({})",
+                options.max_scan_bytes
+            ),
+        ));
+    }
     let value = serde_json::from_str::<serde_json::Value>(input)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let rows = match value {
@@ -123,10 +159,23 @@ pub fn preview_json(input: &str, options: ImportPreviewOptions) -> io::Result<Im
             ));
         }
     };
-    preview_json_values(rows.into_iter().map(Ok), options.max_rows)
+    preview_json_values(
+        rows.into_iter().map(Ok),
+        options.max_rows,
+        options.max_scan_rows,
+    )
 }
 
 pub fn preview_ndjson(input: &str, options: ImportPreviewOptions) -> io::Result<ImportPreview> {
+    if input.len() > options.max_scan_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "NDJSON preview input exceeds max_scan_bytes ({})",
+                options.max_scan_bytes
+            ),
+        ));
+    }
     preview_json_values(
         input.lines().enumerate().filter_map(|(line_index, line)| {
             if line.trim().is_empty() {
@@ -143,6 +192,7 @@ pub fn preview_ndjson(input: &str, options: ImportPreviewOptions) -> io::Result<
             }
         }),
         options.max_rows,
+        options.max_scan_rows,
     )
 }
 
@@ -170,7 +220,12 @@ pub fn preview_delimited<R: io::Read>(
     let mut width = headers.len();
     let mut inferred_types = vec![InferredType::Null; width];
     let mut total_rows_seen = 0;
+    let scan_limit = options.preview.max_scan_rows.max(options.preview.max_rows);
     while rdr.read_record(&mut record)? {
+        if total_rows_seen >= scan_limit {
+            total_rows_seen += 1;
+            break;
+        }
         if width == 0 || record.len() > width {
             width = record.len();
             inferred_types.resize(width, InferredType::Null);
@@ -215,7 +270,7 @@ pub fn preview_delimited<R: io::Read>(
         rows,
         inferred_types,
         total_rows_seen,
-        total_rows_seen > options.preview.max_rows,
+        total_rows_seen > options.preview.max_rows || total_rows_seen > scan_limit,
     ))
 }
 
@@ -393,13 +448,19 @@ fn delimited_value_to_sql(value: &str, backslash_escapes: bool) -> io::Result<St
 fn preview_json_values(
     values: impl Iterator<Item = io::Result<serde_json::Value>>,
     max_rows: usize,
+    max_scan_rows: usize,
 ) -> io::Result<ImportPreview> {
     let mut headers = Vec::<String>::new();
     let mut rows = Vec::<Vec<(String, OwnedCell)>>::new();
     let mut inferred_types = Vec::<InferredType>::new();
     let mut total_rows_seen = 0;
+    let scan_limit = max_scan_rows.max(max_rows);
 
     for value in values {
+        if total_rows_seen >= scan_limit {
+            total_rows_seen += 1;
+            break;
+        }
         let value = value?;
         let serde_json::Value::Object(map) = value else {
             return Err(io::Error::new(

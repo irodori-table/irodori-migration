@@ -100,6 +100,26 @@ impl Default for AdaptiveChunking {
     }
 }
 
+impl AdaptiveChunking {
+    pub fn next_chunk_size(&self, current_chunk_size: u64, elapsed_seconds: f64) -> u64 {
+        let current = current_chunk_size.max(1);
+        if elapsed_seconds <= 0.0 || self.chunk_time_seconds <= 0.0 {
+            return current;
+        }
+        let ratio = self.chunk_time_seconds / elapsed_seconds;
+        let bounded_ratio = ratio.clamp(1.0 / self.chunk_size_limit, self.chunk_size_limit);
+        ((current as f64) * bounded_ratio).round().max(1.0) as u64
+    }
+
+    pub fn throttle_conditions(&self) -> Vec<String> {
+        let mut conditions = self.max_load.clone();
+        if let Some(max_lag) = self.max_lag_seconds {
+            conditions.push(format!("replica_lag_seconds<={max_lag}"));
+        }
+        conditions
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncAlgorithm {
     Chunk,
@@ -107,9 +127,25 @@ pub enum SyncAlgorithm {
     GroupBy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncRepairAction {
+    Update,
+    Insert,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRepairTemplate {
+    pub action: SyncRepairAction,
+    pub sql_template: String,
+    pub parameters: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncRepairPlan {
     pub algorithm: SyncAlgorithm,
+    pub templates: Vec<SyncRepairTemplate>,
+    /// Compatibility projection of `templates[*].sql_template`.
     pub statements: Vec<String>,
     pub notes: Vec<String>,
 }
@@ -190,32 +226,89 @@ pub fn build_sync_repair_plan(
     algorithm: SyncAlgorithm,
 ) -> SyncRepairPlan {
     let keys = if key_columns.is_empty() {
-        vec!["<primary_key>".to_string()]
+        vec!["primary_key".to_string()]
     } else {
         key_columns.to_vec()
     };
     let updates = if update_columns.is_empty() {
-        vec!["<changed_column>".to_string()]
+        vec!["changed_column".to_string()]
     } else {
         update_columns.to_vec()
     };
     let target = table_ref(engine, target_table);
     let key_predicate = keys
         .iter()
-        .map(|key| format!("{} = <source.{}>", column_ref(engine, key), key))
+        .map(|key| {
+            format!(
+                "{} = {}",
+                column_ref(engine, key),
+                named_parameter("key", key)
+            )
+        })
         .collect::<Vec<_>>()
         .join(" AND ");
     let update_list = updates
         .iter()
-        .map(|column| format!("{} = <source.{}>", column_ref(engine, column), column))
+        .map(|column| {
+            format!(
+                "{} = {}",
+                column_ref(engine, column),
+                named_parameter("source", column)
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    let statements = vec![
-        format!("-- Re-checksum sub-chunks before executing repair SQL against {target}."),
-        format!("UPDATE {target} SET {update_list} WHERE {key_predicate};"),
-        format!("INSERT INTO {target} (<columns>) VALUES (<source values>);"),
-        format!("DELETE FROM {target} WHERE {key_predicate};"),
+    let insert_columns = keys
+        .iter()
+        .chain(updates.iter())
+        .map(|column| column_ref(engine, column))
+        .collect::<Vec<_>>();
+    let insert_values = keys
+        .iter()
+        .map(|column| named_parameter("key", column))
+        .chain(
+            updates
+                .iter()
+                .map(|column| named_parameter("source", column)),
+        )
+        .collect::<Vec<_>>();
+    let template_parameters = keys
+        .iter()
+        .map(|column| parameter_name("key", column))
+        .chain(
+            updates
+                .iter()
+                .map(|column| parameter_name("source", column)),
+        )
+        .collect::<Vec<_>>();
+    let templates = vec![
+        SyncRepairTemplate {
+            action: SyncRepairAction::Update,
+            sql_template: format!("UPDATE {target} SET {update_list} WHERE {key_predicate};"),
+            parameters: template_parameters.clone(),
+        },
+        SyncRepairTemplate {
+            action: SyncRepairAction::Insert,
+            sql_template: format!(
+                "INSERT INTO {target} ({}) VALUES ({});",
+                insert_columns.join(", "),
+                insert_values.join(", ")
+            ),
+            parameters: template_parameters,
+        },
+        SyncRepairTemplate {
+            action: SyncRepairAction::Delete,
+            sql_template: format!("DELETE FROM {target} WHERE {key_predicate};"),
+            parameters: keys
+                .iter()
+                .map(|column| parameter_name("key", column))
+                .collect(),
+        },
     ];
+    let statements = templates
+        .iter()
+        .map(|template| template.sql_template.clone())
+        .collect();
     let notes = match algorithm {
         SyncAlgorithm::Chunk => vec![
             "Chunk: checksum large ranges first, then inspect rows only inside failed chunks."
@@ -232,9 +325,28 @@ pub fn build_sync_repair_plan(
     };
     SyncRepairPlan {
         algorithm,
+        templates,
         statements,
         notes,
     }
+}
+
+fn named_parameter(prefix: &str, column: &str) -> String {
+    format!(":{}", parameter_name(prefix, column))
+}
+
+fn parameter_name(prefix: &str, column: &str) -> String {
+    let mut name = String::with_capacity(prefix.len() + column.len() + 1);
+    name.push_str(prefix);
+    name.push('_');
+    for ch in column.chars() {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_lowercase());
+        } else {
+            name.push('_');
+        }
+    }
+    name
 }
 
 fn row_hash_as_integer(
@@ -276,7 +388,16 @@ fn md5_hex_sql(engine: MigrationEngine, value: &str) -> String {
     match engine {
         MigrationEngine::Oracle => format!("STANDARD_HASH({value}, 'MD5')"),
         MigrationEngine::TrinoPresto => format!("TO_HEX(MD5(TO_UTF8({value})))"),
-        _ => format!("MD5({value})"),
+        MigrationEngine::Postgres
+        | MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Snowflake
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Redshift
+        | MigrationEngine::Databricks => format!("MD5({value})"),
     }
 }
 
@@ -285,7 +406,15 @@ fn sha1_hex_sql(engine: MigrationEngine, value: &str) -> String {
         MigrationEngine::Oracle => format!("STANDARD_HASH({value}, 'SHA1')"),
         MigrationEngine::Postgres => format!("ENCODE(DIGEST({value}, 'sha1'), 'hex')"),
         MigrationEngine::TrinoPresto => format!("TO_HEX(SHA1(TO_UTF8({value})))"),
-        _ => format!("SHA1({value})"),
+        MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Snowflake
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Redshift
+        | MigrationEngine::Databricks => format!("SHA1({value})"),
     }
 }
 
@@ -361,7 +490,14 @@ fn decimal_cast_sql(engine: MigrationEngine, value: &str) -> String {
         MigrationEngine::Postgres | MigrationEngine::Redshift => {
             format!("CAST({value} AS NUMERIC(38,0))")
         }
-        _ => format!("CAST({value} AS DECIMAL(38,0))"),
+        MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Databricks
+        | MigrationEngine::TrinoPresto => format!("CAST({value} AS DECIMAL(38,0))"),
     }
 }
 
@@ -389,14 +525,33 @@ fn chunk_predicate(engine: MigrationEngine, bounds: &ChunkBounds) -> String {
 fn string_type(engine: MigrationEngine) -> &'static str {
     match engine {
         MigrationEngine::Hive | MigrationEngine::Databricks => "STRING",
-        _ => "VARCHAR",
+        MigrationEngine::Postgres
+        | MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Oracle
+        | MigrationEngine::Snowflake
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Redshift
+        | MigrationEngine::TrinoPresto => "VARCHAR",
     }
 }
 
 fn integer_type(engine: MigrationEngine) -> &'static str {
     match engine {
         MigrationEngine::Oracle => "NUMBER",
-        _ => "BIGINT",
+        MigrationEngine::Postgres
+        | MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Snowflake
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Redshift
+        | MigrationEngine::Databricks
+        | MigrationEngine::TrinoPresto => "BIGINT",
     }
 }
 
@@ -517,5 +672,19 @@ mod tests {
         assert!(plan.statements.iter().any(|sql| sql.starts_with("UPDATE")));
         assert!(plan.statements.iter().any(|sql| sql.starts_with("INSERT")));
         assert!(plan.statements.iter().any(|sql| sql.starts_with("DELETE")));
+        assert_eq!(plan.templates[0].action, SyncRepairAction::Update);
+        assert!(plan.templates[0].parameters.contains(&"key_id".to_string()));
+        assert!(!plan.statements.join("\n").contains('<'));
+    }
+
+    #[test]
+    fn adaptive_chunking_recommends_bounded_next_size_and_throttle_conditions() {
+        let adaptive = AdaptiveChunking::default();
+
+        assert_eq!(adaptive.next_chunk_size(1_000, 0.25), 2_000);
+        assert_eq!(adaptive.next_chunk_size(1_000, 2.0), 500);
+        assert!(adaptive
+            .throttle_conditions()
+            .contains(&"replica_lag_seconds<=1".to_string()));
     }
 }

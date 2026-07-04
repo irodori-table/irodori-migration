@@ -274,7 +274,14 @@ fn decimal_sql(engine: MigrationEngine, value: &str, scale: u8) -> String {
         MigrationEngine::MySql | MigrationEngine::MariaDb => {
             format!("CAST(CAST({value} AS DECIMAL(38,{scale})) AS CHAR)")
         }
-        _ => text_sql(engine, &format!("CAST({value} AS DECIMAL(38,{scale}))")),
+        MigrationEngine::Postgres
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Redshift
+        | MigrationEngine::TrinoPresto => {
+            text_sql(engine, &format!("CAST({value} AS DECIMAL(38,{scale}))"))
+        }
     }
 }
 
@@ -284,7 +291,16 @@ fn float_sql(engine: MigrationEngine, value: &str, precision: u8) -> String {
             engine,
             &format!("ROUND(CAST({value} AS NUMERIC), {precision})"),
         ),
-        _ => text_sql(engine, &format!("ROUND({value}, {precision})")),
+        MigrationEngine::Oracle
+        | MigrationEngine::Snowflake
+        | MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Databricks
+        | MigrationEngine::TrinoPresto => text_sql(engine, &format!("ROUND({value}, {precision})")),
     }
 }
 
@@ -336,7 +352,12 @@ fn timestamp_sql(
                 format!("DATE_FORMAT(CAST({value} AS TIMESTAMP), 'yyyy-MM-dd HH:mm:ss.SSSSSS')");
             pad_fraction(engine, &rendered, precision)
         }
-        _ => pad_fraction(engine, &text_sql(engine, &value), precision),
+        MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::TrinoPresto => {
+            pad_fraction(engine, &text_sql(engine, &value), precision)
+        }
     }
 }
 
@@ -347,7 +368,14 @@ fn date_sql(engine: MigrationEngine, value: &str) -> String {
         MigrationEngine::MySql | MigrationEngine::MariaDb => {
             format!("DATE_FORMAT({value}, '%Y-%m-%d')")
         }
-        _ => text_sql(engine, &format!("CAST({value} AS DATE)")),
+        MigrationEngine::Postgres
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Redshift
+        | MigrationEngine::Databricks
+        | MigrationEngine::TrinoPresto => text_sql(engine, &format!("CAST({value} AS DATE)")),
     }
 }
 
@@ -364,7 +392,11 @@ fn bytes_sql(engine: MigrationEngine, value: &str) -> String {
         MigrationEngine::Snowflake => format!("UPPER(HEX_ENCODE({value}))"),
         MigrationEngine::MySql | MigrationEngine::MariaDb => format!("UPPER(HEX({value}))"),
         MigrationEngine::TrinoPresto => format!("UPPER(TO_HEX({value}))"),
-        _ => format!("UPPER(HEX({value}))"),
+        MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Databricks => format!("UPPER(HEX({value}))"),
     }
 }
 
@@ -401,11 +433,31 @@ fn pad_fraction(engine: MigrationEngine, value: &str, precision: u8) -> String {
     let width = if precision == 0 { 19 } else { 26 };
     let prefix = match engine {
         MigrationEngine::Oracle => format!("SUBSTR({value}, 1, {keep})"),
-        _ => format!("LEFT({value}, {keep})"),
+        MigrationEngine::Postgres
+        | MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Snowflake
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Redshift
+        | MigrationEngine::Databricks
+        | MigrationEngine::TrinoPresto => format!("LEFT({value}, {keep})"),
     };
     match engine {
         MigrationEngine::Oracle => format!("RPAD({prefix}, {width}, '0')"),
-        _ => format!("RPAD({prefix}, {width}, '0')"),
+        MigrationEngine::Postgres
+        | MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Snowflake
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Redshift
+        | MigrationEngine::Databricks
+        | MigrationEngine::TrinoPresto => format!("RPAD({prefix}, {width}, '0')"),
     }
 }
 
@@ -437,7 +489,17 @@ fn concat_raw_sql(engine: MigrationEngine, values: &[String]) -> String {
 fn length_sql(engine: MigrationEngine, value: &str) -> String {
     match engine {
         MigrationEngine::Oracle => format!("LENGTH({value})"),
-        _ => format!("LENGTH({value})"),
+        MigrationEngine::Postgres
+        | MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Snowflake
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Redshift
+        | MigrationEngine::Databricks
+        | MigrationEngine::TrinoPresto => format!("LENGTH({value})"),
     }
 }
 

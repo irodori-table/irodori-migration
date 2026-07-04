@@ -2,6 +2,28 @@
 
 All notable changes to `irodori-migration` are documented here.
 
+## 0.4.0 - 2026-07-04
+
+- Added `TableRef` and shared table-reference rendering for catalog/schema/table
+  identifiers, including fail-closed parsing for ambiguous dotted references.
+- Added `try_build_migration_plan` with typed `MigrationPlanError` issues for
+  missing/invalid table refs, empty key columns, and empty hash inputs.
+- Removed remaining hot-path `MigrationEngine` catch-all match arms from
+  canonical, checksum, and DDL rendering helpers.
+- Bounded import previews with separate display-row, scan-row, and JSON byte
+  caps; NDJSON and delimited previews stop scanning after the configured limit.
+- Changed Parquet export to flush bounded row groups instead of buffering all
+  rows until `finish`.
+- Implemented `AdaptiveChunking` sizing helpers and converted sync repair output
+  to typed named-parameter templates while keeping a compatibility statement
+  projection.
+- Reduced export cancellation latency by checking cancellation before every row,
+  fixed hot-path null marker cloning, improved SQL Server `ORDER BY` detection,
+  and emitted clean empty JSON arrays.
+- Expanded unit and Docker-gated tests for typed plan errors, TableRef quoting,
+  preview bounds, IO edge cases, Parquet row-group flushing, and generated
+  DDL/INSERT SQL execution.
+
 ## 0.3.0 - 2026-07-04
 
 - Fixed cross-engine checksum generation to avoid MySQL-only SQL on unsupported

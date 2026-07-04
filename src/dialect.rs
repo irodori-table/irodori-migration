@@ -276,12 +276,92 @@ fn trim_trailing_semicolon(sql: &str) -> &str {
 }
 
 fn contains_order_by(sql: &str) -> bool {
-    let lower = sql.to_ascii_lowercase();
-    lower
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|pair| matches!(pair, ["order", "by"]))
+    let mut previous_token_was_order = false;
+    for token in sql_tokens_outside_literals(sql) {
+        if previous_token_was_order && token.eq_ignore_ascii_case("by") {
+            return true;
+        }
+        previous_token_was_order = token.eq_ignore_ascii_case("order");
+    }
+    false
+}
+
+fn sql_tokens_outside_literals(sql: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while let Some(ch) = chars.next() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if in_single_quote {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    in_single_quote = false;
+                }
+            }
+            continue;
+        }
+        if in_double_quote {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                } else {
+                    in_double_quote = false;
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => {
+                flush_token(&mut tokens, &mut token);
+                in_single_quote = true;
+            }
+            '"' => {
+                flush_token(&mut tokens, &mut token);
+                in_double_quote = true;
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                chars.next();
+                flush_token(&mut tokens, &mut token);
+                in_line_comment = true;
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                flush_token(&mut tokens, &mut token);
+                in_block_comment = true;
+            }
+            ch if ch == '_' || ch.is_ascii_alphanumeric() => token.push(ch),
+            _ => flush_token(&mut tokens, &mut token),
+        }
+    }
+
+    flush_token(&mut tokens, &mut token);
+    tokens
+}
+
+fn flush_token(tokens: &mut Vec<String>, token: &mut String) {
+    if !token.is_empty() {
+        tokens.push(std::mem::take(token));
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +468,14 @@ mod tests {
                 }
             ),
             "select * from t order by id OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY"
+        );
+        assert_eq!(
+            SqlServerDialect.page_query("select 'order by id' as label from t", Page::first(10)),
+            "select 'order by id' as label from t ORDER BY (SELECT 0) OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY"
+        );
+        assert_eq!(
+            SqlServerDialect.page_query("select * from t /* order by id */", Page::first(10)),
+            "select * from t /* order by id */ ORDER BY (SELECT 0) OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY"
         );
     }
 }

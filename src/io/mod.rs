@@ -200,10 +200,12 @@ impl<W: Write> DelimitedEncoder<W> {
                 self.writer.write_all(&[self.options.delimiter])?;
             }
             match cell {
-                Cell::Null => {
-                    let null_value = self.options.null_value.clone();
-                    self.write_field(&null_value)?;
-                }
+                Cell::Null => write_delimited_field_value(
+                    &mut self.writer,
+                    &self.options,
+                    &self.options.null_value,
+                    false,
+                )?,
                 Cell::Bool(value) => self.write_field(if *value { "true" } else { "false" })?,
                 Cell::Integer(value) => self.write_field(&value.to_string())?,
                 Cell::Float(value) if value.is_finite() => self.write_field(&value.to_string())?,
@@ -229,42 +231,46 @@ impl<W: Write> DelimitedEncoder<W> {
     }
 
     fn write_field(&mut self, field: &str) -> io::Result<()> {
-        self.write_field_value(field, false)
+        write_delimited_field_value(&mut self.writer, &self.options, field, false)
     }
 
     fn write_text_field(&mut self, field: &str) -> io::Result<()> {
-        self.write_field_value(field, true)
+        write_delimited_field_value(&mut self.writer, &self.options, field, true)
     }
+}
 
-    fn write_field_value(&mut self, field: &str, formula_guard: bool) -> io::Result<()> {
-        let field = guard_delimited_formula(field, formula_guard);
-        let needs_quote = needs_quote(field.as_ref(), &self.options);
-        let quoted = match self.options.quote_style {
-            QuoteStyle::Always => true,
-            QuoteStyle::Necessary => needs_quote,
-            QuoteStyle::Never if needs_quote => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "field requires quoting but quote style is Never",
-                ));
-            }
-            QuoteStyle::Never => false,
-        };
-
-        if quoted {
-            self.writer.write_all(&[self.options.quote])?;
-            for byte in field.as_ref().as_bytes() {
-                if *byte == self.options.quote {
-                    self.writer
-                        .write_all(&[self.options.quote, self.options.quote])?;
-                } else {
-                    self.writer.write_all(&[*byte])?;
-                }
-            }
-            self.writer.write_all(&[self.options.quote])
-        } else {
-            self.writer.write_all(field.as_ref().as_bytes())
+fn write_delimited_field_value(
+    writer: &mut impl Write,
+    options: &DelimitedOptions,
+    field: &str,
+    formula_guard: bool,
+) -> io::Result<()> {
+    let field = guard_delimited_formula(field, formula_guard);
+    let needs_quote = needs_quote(field.as_ref(), options);
+    let quoted = match options.quote_style {
+        QuoteStyle::Always => true,
+        QuoteStyle::Necessary => needs_quote,
+        QuoteStyle::Never if needs_quote => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "field requires quoting but quote style is Never",
+            ));
         }
+        QuoteStyle::Never => false,
+    };
+
+    if quoted {
+        writer.write_all(&[options.quote])?;
+        for byte in field.as_ref().as_bytes() {
+            if *byte == options.quote {
+                writer.write_all(&[options.quote, options.quote])?;
+            } else {
+                writer.write_all(&[*byte])?;
+            }
+        }
+        writer.write_all(&[options.quote])
+    } else {
+        writer.write_all(field.as_ref().as_bytes())
     }
 }
 
@@ -591,8 +597,7 @@ pub struct JsonEncoder<W> {
 }
 
 impl<W: Write> JsonEncoder<W> {
-    pub fn new<S: AsRef<str>>(mut writer: W, columns: &[S]) -> io::Result<Self> {
-        writer.write_all(b"[\n")?;
+    pub fn new<S: AsRef<str>>(writer: W, columns: &[S]) -> io::Result<Self> {
         Ok(Self {
             writer,
             columns: columns.iter().map(|c| c.as_ref().to_string()).collect(),
@@ -603,7 +608,9 @@ impl<W: Write> JsonEncoder<W> {
     pub fn write_row(&mut self, row: &[Cell<'_>]) -> io::Result<()> {
         validate_row_width(row.len(), self.columns.len())?;
         let json_val = json_object_from_row(&self.columns, row)?;
-        if !self.first {
+        if self.first {
+            self.writer.write_all(b"[\n")?;
+        } else {
             self.writer.write_all(b",\n")?;
         }
         self.first = false;
@@ -612,7 +619,11 @@ impl<W: Write> JsonEncoder<W> {
     }
 
     pub fn finish(&mut self) -> io::Result<()> {
-        self.writer.write_all(b"\n]\n")?;
+        if self.first {
+            self.writer.write_all(b"[]\n")?;
+        } else {
+            self.writer.write_all(b"\n]\n")?;
+        }
         self.writer.flush()
     }
 }
@@ -773,158 +784,259 @@ impl<W: Write> TabularEncoder for AvroEncoder<W> {
 #[cfg(feature = "parquet")]
 pub struct ParquetEncoder<W: Write + Send> {
     writer: Option<W>,
+    arrow_writer: Option<parquet::arrow::ArrowWriter<W>>,
+    schema: Option<std::sync::Arc<arrow::datatypes::Schema>>,
     columns: Vec<String>,
     buffered_rows: Vec<Vec<OwnedCell>>,
+    row_group_size: usize,
 }
 
 #[cfg(feature = "parquet")]
 impl<W: Write + Send> ParquetEncoder<W> {
-    const MAX_BUFFERED_ROWS: usize = 100_000;
+    pub const DEFAULT_ROW_GROUP_ROWS: usize = 10_000;
+    pub const MAX_BUFFERED_ROWS: usize = Self::DEFAULT_ROW_GROUP_ROWS;
 
     pub fn new(writer: W, columns: &[impl AsRef<str>]) -> Self {
         Self {
             writer: Some(writer),
+            arrow_writer: None,
+            schema: None,
             columns: columns.iter().map(|c| c.as_ref().to_string()).collect(),
             buffered_rows: Vec::new(),
+            row_group_size: Self::DEFAULT_ROW_GROUP_ROWS,
         }
+    }
+
+    pub fn with_row_group_size(mut self, row_group_size: usize) -> Self {
+        self.row_group_size = row_group_size.clamp(1, 100_000);
+        self
     }
 
     pub fn write_row(&mut self, row: &[Cell<'_>]) -> io::Result<()> {
         validate_row_width(row.len(), self.columns.len())?;
         validate_finite_cells(row)?;
-        if self.buffered_rows.len() >= Self::MAX_BUFFERED_ROWS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "parquet encoder buffers rows and reached the bounded row limit",
-            ));
-        }
         self.buffered_rows
             .push(row.iter().map(|c| c.to_owned()).collect());
+        if self.buffered_rows.len() >= self.row_group_size {
+            self.flush_buffered_rows()?;
+        }
         Ok(())
     }
 
     pub fn finish(&mut self) -> io::Result<()> {
-        use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
-        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-        use arrow::record_batch::RecordBatch;
-        use parquet::arrow::ArrowWriter;
-        use std::sync::Arc;
+        if !self.buffered_rows.is_empty() {
+            self.flush_buffered_rows()?;
+        }
+        if self.arrow_writer.is_none() {
+            let schema = self
+                .schema
+                .clone()
+                .unwrap_or_else(|| self.empty_parquet_schema());
+            self.start_parquet_writer(schema)?;
+        }
+        if let Some(writer) = self.arrow_writer.take() {
+            writer
+                .close()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        Ok(())
+    }
 
+    fn flush_buffered_rows(&mut self) -> io::Result<()> {
+        if self.buffered_rows.is_empty() {
+            return Ok(());
+        }
+        let schema = match self.schema.clone() {
+            Some(schema) => schema,
+            None => {
+                let schema = self.infer_parquet_schema();
+                self.schema = Some(schema.clone());
+                schema
+            }
+        };
+        if self.arrow_writer.is_none() {
+            self.start_parquet_writer(schema.clone())?;
+        }
+        let batch = parquet_record_batch(schema, &self.buffered_rows)?;
+        if let Some(writer) = &mut self.arrow_writer {
+            writer
+                .write(&batch)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        self.buffered_rows.clear();
+        Ok(())
+    }
+
+    fn start_parquet_writer(
+        &mut self,
+        schema: std::sync::Arc<arrow::datatypes::Schema>,
+    ) -> io::Result<()> {
         let writer = match self.writer.take() {
-            Some(w) => w,
+            Some(writer) => writer,
             None => return Ok(()),
         };
+        self.arrow_writer = Some(
+            parquet::arrow::ArrowWriter::try_new(writer, schema, None)
+                .map_err(|e| io::Error::other(e.to_string()))?,
+        );
+        Ok(())
+    }
 
-        let num_rows = self.buffered_rows.len();
+    fn infer_parquet_schema(&self) -> std::sync::Arc<arrow::datatypes::Schema> {
+        use arrow::datatypes::{Field, Schema as ArrowSchema};
+        use std::sync::Arc;
+
         let mut fields = Vec::new();
-        let mut arrays: Vec<ArrayRef> = Vec::new();
 
         for (col_idx, col_name) in self.columns.iter().enumerate() {
-            let mut has_int = false;
-            let mut has_float = false;
-            let mut has_bool = false;
-            let mut has_text = false;
+            let kind = infer_parquet_column_kind(&self.buffered_rows, col_idx);
+            fields.push(Field::new(col_name, kind.data_type(), true));
+        }
 
-            for row in &self.buffered_rows {
-                if let Some(cell) = row.get(col_idx) {
-                    match cell {
-                        OwnedCell::Integer(_) => has_int = true,
-                        OwnedCell::Float(_) => has_float = true,
-                        OwnedCell::Bool(_) => has_bool = true,
-                        OwnedCell::Text(_) => has_text = true,
-                        OwnedCell::Null => {}
-                    }
-                }
+        Arc::new(ArrowSchema::new(fields))
+    }
+
+    fn empty_parquet_schema(&self) -> std::sync::Arc<arrow::datatypes::Schema> {
+        use arrow::datatypes::{Field, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        Arc::new(ArrowSchema::new(
+            self.columns
+                .iter()
+                .map(|column| Field::new(column, ParquetColumnKind::Utf8.data_type(), true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+}
+
+#[cfg(feature = "parquet")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParquetColumnKind {
+    Utf8,
+    Float64,
+    Int64,
+    Boolean,
+}
+
+#[cfg(feature = "parquet")]
+impl ParquetColumnKind {
+    fn data_type(self) -> arrow::datatypes::DataType {
+        match self {
+            Self::Utf8 => arrow::datatypes::DataType::Utf8,
+            Self::Float64 => arrow::datatypes::DataType::Float64,
+            Self::Int64 => arrow::datatypes::DataType::Int64,
+            Self::Boolean => arrow::datatypes::DataType::Boolean,
+        }
+    }
+
+    fn from_data_type(data_type: &arrow::datatypes::DataType) -> io::Result<Self> {
+        match data_type {
+            arrow::datatypes::DataType::Utf8 => Ok(Self::Utf8),
+            arrow::datatypes::DataType::Float64 => Ok(Self::Float64),
+            arrow::datatypes::DataType::Int64 => Ok(Self::Int64),
+            arrow::datatypes::DataType::Boolean => Ok(Self::Boolean),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported parquet data type: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "parquet")]
+fn infer_parquet_column_kind(rows: &[Vec<OwnedCell>], col_idx: usize) -> ParquetColumnKind {
+    let mut has_int = false;
+    let mut has_float = false;
+    let mut has_bool = false;
+    let mut has_text = false;
+
+    for row in rows {
+        if let Some(cell) = row.get(col_idx) {
+            match cell {
+                OwnedCell::Integer(_) => has_int = true,
+                OwnedCell::Float(_) => has_float = true,
+                OwnedCell::Bool(_) => has_bool = true,
+                OwnedCell::Text(_) => has_text = true,
+                OwnedCell::Null => {}
             }
+        }
+    }
 
-            if has_text || (has_bool && has_int) || (has_bool && has_float) {
-                let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 16);
-                for row in &self.buffered_rows {
-                    if let Some(cell) = row.get(col_idx) {
-                        match cell {
-                            OwnedCell::Null => builder.append_null(),
-                            OwnedCell::Bool(b) => {
-                                builder.append_value(if *b { "true" } else { "false" })
-                            }
-                            OwnedCell::Integer(i) => builder.append_value(i.to_string()),
-                            OwnedCell::Float(f) => builder.append_value(f.to_string()),
-                            OwnedCell::Text(s) => builder.append_value(s),
+    if has_text || (has_bool && has_int) || (has_bool && has_float) {
+        ParquetColumnKind::Utf8
+    } else if has_float {
+        ParquetColumnKind::Float64
+    } else if has_int {
+        ParquetColumnKind::Int64
+    } else if has_bool {
+        ParquetColumnKind::Boolean
+    } else {
+        ParquetColumnKind::Utf8
+    }
+}
+
+#[cfg(feature = "parquet")]
+fn parquet_record_batch(
+    schema: std::sync::Arc<arrow::datatypes::Schema>,
+    rows: &[Vec<OwnedCell>],
+) -> io::Result<arrow::record_batch::RecordBatch> {
+    use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
+    use std::sync::Arc;
+
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        match ParquetColumnKind::from_data_type(field.data_type())? {
+            ParquetColumnKind::Utf8 => {
+                let mut builder = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+                for row in rows {
+                    match row.get(col_idx) {
+                        Some(OwnedCell::Null) | None => builder.append_null(),
+                        Some(OwnedCell::Bool(value)) => {
+                            builder.append_value(if *value { "true" } else { "false" })
                         }
-                    } else {
-                        builder.append_null();
+                        Some(OwnedCell::Integer(value)) => builder.append_value(value.to_string()),
+                        Some(OwnedCell::Float(value)) => builder.append_value(value.to_string()),
+                        Some(OwnedCell::Text(value)) => builder.append_value(value),
                     }
                 }
-                fields.push(Field::new(col_name, DataType::Utf8, true));
                 arrays.push(Arc::new(builder.finish()));
-            } else if has_float {
-                let mut builder = Float64Builder::with_capacity(num_rows);
-                for row in &self.buffered_rows {
-                    if let Some(cell) = row.get(col_idx) {
-                        match cell {
-                            OwnedCell::Null => builder.append_null(),
-                            OwnedCell::Integer(i) => builder.append_value(*i as f64),
-                            OwnedCell::Float(f) => builder.append_value(*f),
-                            _ => builder.append_null(),
-                        }
-                    } else {
-                        builder.append_null();
+            }
+            ParquetColumnKind::Float64 => {
+                let mut builder = Float64Builder::with_capacity(rows.len());
+                for row in rows {
+                    match row.get(col_idx) {
+                        Some(OwnedCell::Integer(value)) => builder.append_value(*value as f64),
+                        Some(OwnedCell::Float(value)) => builder.append_value(*value),
+                        _ => builder.append_null(),
                     }
                 }
-                fields.push(Field::new(col_name, DataType::Float64, true));
                 arrays.push(Arc::new(builder.finish()));
-            } else if has_int {
-                let mut builder = Int64Builder::with_capacity(num_rows);
-                for row in &self.buffered_rows {
-                    if let Some(cell) = row.get(col_idx) {
-                        match cell {
-                            OwnedCell::Null => builder.append_null(),
-                            OwnedCell::Integer(i) => builder.append_value(*i),
-                            _ => builder.append_null(),
-                        }
-                    } else {
-                        builder.append_null();
+            }
+            ParquetColumnKind::Int64 => {
+                let mut builder = Int64Builder::with_capacity(rows.len());
+                for row in rows {
+                    match row.get(col_idx) {
+                        Some(OwnedCell::Integer(value)) => builder.append_value(*value),
+                        _ => builder.append_null(),
                     }
                 }
-                fields.push(Field::new(col_name, DataType::Int64, true));
                 arrays.push(Arc::new(builder.finish()));
-            } else if has_bool {
-                let mut builder = BooleanBuilder::with_capacity(num_rows);
-                for row in &self.buffered_rows {
-                    if let Some(cell) = row.get(col_idx) {
-                        match cell {
-                            OwnedCell::Null => builder.append_null(),
-                            OwnedCell::Bool(b) => builder.append_value(*b),
-                            _ => builder.append_null(),
-                        }
-                    } else {
-                        builder.append_null();
+            }
+            ParquetColumnKind::Boolean => {
+                let mut builder = BooleanBuilder::with_capacity(rows.len());
+                for row in rows {
+                    match row.get(col_idx) {
+                        Some(OwnedCell::Bool(value)) => builder.append_value(*value),
+                        _ => builder.append_null(),
                     }
                 }
-                fields.push(Field::new(col_name, DataType::Boolean, true));
-                arrays.push(Arc::new(builder.finish()));
-            } else {
-                let mut builder = StringBuilder::with_capacity(num_rows, 0);
-                for _ in 0..num_rows {
-                    builder.append_null();
-                }
-                fields.push(Field::new(col_name, DataType::Utf8, true));
                 arrays.push(Arc::new(builder.finish()));
             }
         }
-
-        let schema = Arc::new(ArrowSchema::new(fields));
-        let batch = RecordBatch::try_new(schema, arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let mut arrow_writer = ArrowWriter::try_new(writer, batch.schema(), None)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        arrow_writer
-            .write(&batch)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        arrow_writer
-            .close()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        Ok(())
     }
+
+    arrow::record_batch::RecordBatch::try_new(schema, arrays)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
 #[cfg(feature = "parquet")]
@@ -1176,6 +1288,23 @@ mod tests {
     }
 
     #[test]
+    fn quote_style_always_quotes_null_marker() {
+        let mut out = Vec::new();
+        let options = DelimitedOptions::csv()
+            .with_header(false)
+            .with_null_value("NULL")
+            .with_quote_style(QuoteStyle::Always);
+        let mut encoder =
+            DelimitedEncoder::new(&mut out, &["missing", "name"], options).expect("encoder");
+
+        encoder
+            .write_row(&[Cell::Null, Cell::Text("A")])
+            .expect("row");
+
+        assert_eq!(String::from_utf8(out).unwrap(), "\"NULL\",\"A\"\n");
+    }
+
+    #[test]
     fn quote_style_never_rejects_ambiguous_fields() {
         let mut out = Vec::new();
         let options = DelimitedOptions::csv()
@@ -1288,6 +1417,28 @@ mod tests {
     }
 
     #[test]
+    fn sql_insert_writes_null_float_and_object_cells() {
+        let mut out = Vec::new();
+        let dialect = crate::dialect::PostgresDialect;
+        let mut encoder =
+            SqlInsertEncoder::new(&mut out, "events", &["id", "score", "payload"], &dialect);
+
+        encoder
+            .write_row(&[
+                Cell::Null,
+                Cell::Float(12.5),
+                Cell::Object(r#"{"kind":"table"}"#),
+            ])
+            .expect("row");
+        encoder.finish().expect("finish");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "INSERT INTO \"events\" (\"id\", \"score\", \"payload\") VALUES (NULL, 12.5, '{\"kind\":\"table\"}');\n"
+        );
+    }
+
+    #[test]
     fn sql_script_batches_inserts_and_can_emit_schema() {
         let mut out = Vec::new();
         let dialect = crate::dialect::PostgresDialect;
@@ -1353,6 +1504,38 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
     }
 
     #[test]
+    fn sql_script_upsert_derives_update_columns_when_empty() {
+        let dialect = crate::dialect::PostgresDialect;
+        let mut out = Vec::new();
+        let options = SqlScriptOptions::upsert(
+            ["id"],
+            std::iter::empty::<&str>(),
+            UpsertStyle::PostgresOrSqlite,
+        );
+        let mut encoder = SqlScriptEncoder::new(
+            &mut out,
+            "users",
+            &["id", "name", "email"],
+            &dialect,
+            options,
+        )
+        .expect("encoder");
+        encoder
+            .write_row(&[
+                Cell::Integer(1),
+                Cell::Text("A"),
+                Cell::Text("a@example.com"),
+            ])
+            .expect("row");
+        encoder.finish().expect("finish");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "INSERT INTO \"users\" (\"id\", \"name\", \"email\") VALUES (1, 'A', 'a@example.com') ON CONFLICT (\"id\") DO UPDATE SET \"name\" = excluded.\"name\", \"email\" = excluded.\"email\";\n"
+        );
+    }
+
+    #[test]
     fn sql_script_rejects_non_finite_floats() {
         let mut out = Vec::new();
         let dialect = crate::dialect::PostgresDialect;
@@ -1394,6 +1577,16 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
     }
 
     #[test]
+    fn json_finish_without_rows_writes_empty_array() {
+        let mut out = Vec::new();
+        let mut encoder = JsonEncoder::new(&mut out, &["id"]).expect("encoder");
+
+        encoder.finish().expect("finish");
+
+        assert_eq!(String::from_utf8(out).unwrap(), "[]\n");
+    }
+
+    #[test]
     fn ndjson_writes_lines() {
         let mut out = Vec::new();
         let mut encoder = NdjsonEncoder::new(&mut out, &["id", "name"]);
@@ -1416,7 +1609,7 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
     fn json_preview_maps_columns_and_infers_types() {
         let preview = preview_json(
             r#"[{"id":1,"name":"Bob","active":true},{"id":2,"name":"Cat","meta":{"tier":"gold"}}]"#,
-            ImportPreviewOptions { max_rows: 10 },
+            ImportPreviewOptions::default().with_max_rows(10),
         )
         .expect("preview");
 
@@ -1436,13 +1629,30 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
             ]
         );
         assert_eq!(preview.columns[0].target_name, "id");
+        assert_eq!(
+            preview.mapped_columns(&[
+                ColumnMapping {
+                    source_name: "id".to_string(),
+                    target_name: Some("order_id".to_string()),
+                },
+                ColumnMapping {
+                    source_name: "meta".to_string(),
+                    target_name: None,
+                },
+            ]),
+            vec![
+                "order_id".to_string(),
+                "name".to_string(),
+                "active".to_string()
+            ]
+        );
     }
 
     #[test]
     fn ndjson_preview_truncates_without_losing_total_count() {
         let preview = preview_ndjson(
             "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n",
-            ImportPreviewOptions { max_rows: 2 },
+            ImportPreviewOptions::default().with_max_rows(2),
         )
         .expect("preview");
 
@@ -1455,7 +1665,7 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
     fn ndjson_preview_tracks_late_columns_without_buffering_rows() {
         let preview = preview_ndjson(
             "{\"id\":1}\n{\"late\":2}\n",
-            ImportPreviewOptions { max_rows: 1 },
+            ImportPreviewOptions::default().with_max_rows(1),
         )
         .expect("preview");
 
@@ -1477,6 +1687,31 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
             preview.rows[0],
             vec![OwnedCell::Integer(1), OwnedCell::Null]
         );
+    }
+
+    #[test]
+    fn preview_scan_limits_mark_lower_bound_truncation() {
+        let preview = preview_ndjson(
+            "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n",
+            ImportPreviewOptions::default()
+                .with_max_rows(2)
+                .with_max_scan_rows(2),
+        )
+        .expect("preview");
+
+        assert_eq!(preview.rows.len(), 2);
+        assert_eq!(preview.total_rows_seen, 3);
+        assert!(preview.truncated);
+
+        let csv_data = "id\n1\n2\n3\n";
+        let preview = preview_delimited(
+            csv_data.as_bytes(),
+            DelimitedImportOptions::csv().with_max_preview_rows(1),
+        )
+        .expect("preview");
+        assert_eq!(preview.rows.len(), 1);
+        assert_eq!(preview.total_rows_seen, 3);
+        assert!(preview.truncated);
     }
 
     #[test]
@@ -1643,15 +1878,19 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
 
     #[test]
     #[cfg(feature = "parquet")]
-    fn parquet_rejects_after_bounded_buffer_limit() {
+    fn parquet_flushes_bounded_row_groups() {
         let mut out = Vec::new();
-        let mut encoder = ParquetEncoder::new(&mut out, &["value"]);
-        encoder.buffered_rows =
-            vec![vec![OwnedCell::Integer(1)]; ParquetEncoder::<&mut Vec<u8>>::MAX_BUFFERED_ROWS];
+        {
+            let mut encoder = ParquetEncoder::new(&mut out, &["value"]).with_row_group_size(1);
 
-        let err = encoder.write_row(&[Cell::Integer(2)]).unwrap_err();
+            encoder.write_row(&[Cell::Integer(1)]).unwrap();
+            assert!(encoder.buffered_rows.is_empty());
+            encoder.write_row(&[Cell::Integer(2)]).unwrap();
+            assert!(encoder.buffered_rows.is_empty());
+            encoder.finish().unwrap();
+        }
 
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!out.is_empty());
     }
 
     #[test]

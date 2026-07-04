@@ -26,24 +26,24 @@ database connections or stores credentials.
 
 ```toml
 [dependencies]
-irodori-migration = "0.3"
+irodori-migration = "0.4"
 ```
 
 ```rust
-use irodori_migration::{build_migration_plan, MigrationEngine, MigrationSpec};
+use irodori_migration::{try_build_migration_plan, MigrationEngine, MigrationSpec};
 
-let spec = MigrationSpec {
-    source_engine: MigrationEngine::Postgres,
-    target_engine: MigrationEngine::MySql,
-    source_table: "public.orders".into(),
-    target_table: "orders".into(),
-    key_columns: vec!["id".into()],
-    compare_columns: vec!["id".into(), "amount".into()],
-    ..MigrationSpec::default()
-};
+let spec = MigrationSpec::new(
+    MigrationEngine::Postgres,
+    MigrationEngine::MySql,
+    "public.orders",
+    "orders",
+)
+.with_key_columns(vec!["id".into()])
+.with_compare_columns(vec!["id".into(), "amount".into()]);
 
-let plan = build_migration_plan(&spec);
+let plan = try_build_migration_plan(&spec)?;
 println!("{}", plan.diff_sql);
+# Ok::<(), irodori_migration::MigrationPlanError>(())
 ```
 
 ## Develop

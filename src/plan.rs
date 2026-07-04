@@ -5,10 +5,12 @@
 //! scheduling, and object storage access.
 
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
 
 use crate::canonical::{canonical_row_from_values_sql, CanonicalizationPolicy};
 use crate::dialect::{MySqlDialect, OracleDialect, PostgresDialect, SnowflakeDialect, SqlDialect};
-use crate::sql_ref::{column_ref, identifier_ref, table_ref};
+use crate::sql_ref::{column_ref, identifier_ref, table_ref, TableRef, TableRefParseError};
 
 const ROW_HASH_ALGORITHM_LABEL: &str = "MD5";
 const ROW_HASH_CONTRACT_WARNING: &str = "Row hashes must use MD5 over Irodori canonical row strings on both source and target manifests; mixing engine-native hash algorithms will report every row as changed.";
@@ -104,6 +106,24 @@ pub struct ForeignKeySpec {
     pub parent_table: String,
     pub child_columns: Vec<String>,
     pub parent_columns: Vec<String>,
+}
+
+impl ForeignKeySpec {
+    pub fn new(
+        name: impl Into<String>,
+        child_table: impl Into<String>,
+        parent_table: impl Into<String>,
+        child_columns: Vec<String>,
+        parent_columns: Vec<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            child_table: child_table.into(),
+            parent_table: parent_table.into(),
+            child_columns,
+            parent_columns,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +287,23 @@ impl Default for MigrationSpec {
 }
 
 impl MigrationSpec {
+    pub fn new(
+        source_engine: MigrationEngine,
+        target_engine: MigrationEngine,
+        source_table: impl Into<String>,
+        target_table: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_engine,
+            target_engine,
+            source_version: source_engine.label().to_string(),
+            target_version: target_engine.label().to_string(),
+            source_table: source_table.into(),
+            target_table: target_table.into(),
+            ..Self::default()
+        }
+    }
+
     pub fn hive_to_snowflake(
         source_table: impl Into<String>,
         target_table: impl Into<String>,
@@ -298,6 +335,51 @@ impl MigrationSpec {
             normalize_whitespace: true,
             normalize_case: false,
         }
+    }
+
+    pub fn with_source_version(mut self, version: impl Into<String>) -> Self {
+        self.source_version = version.into();
+        self
+    }
+
+    pub fn with_target_version(mut self, version: impl Into<String>) -> Self {
+        self.target_version = version.into();
+        self
+    }
+
+    pub fn with_key_columns(mut self, columns: Vec<String>) -> Self {
+        self.key_columns = columns;
+        self
+    }
+
+    pub fn with_compare_columns(mut self, columns: Vec<String>) -> Self {
+        self.compare_columns = columns;
+        self
+    }
+
+    pub fn with_partition(
+        mut self,
+        column: impl Into<String>,
+        predicate: impl Into<String>,
+    ) -> Self {
+        self.partition_column = column.into();
+        self.partition_predicate = predicate.into();
+        self
+    }
+
+    pub fn with_export_format(mut self, format: MigrationExportFormat) -> Self {
+        self.export_format = format;
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: u64) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    pub fn with_diff_limit(mut self, diff_limit: usize) -> Self {
+        self.diff_limit = diff_limit;
+        self
     }
 
     fn normalized(&self) -> Self {
@@ -332,6 +414,65 @@ pub struct MigrationPlan {
     pub target_sql: String,
     pub diff_sql: String,
     pub runbook: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationPlanError {
+    pub issues: Vec<MigrationPlanIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationPlanIssue {
+    InvalidTableRef {
+        role: &'static str,
+        value: String,
+        reason: TableRefParseError,
+    },
+    MissingKeyColumns,
+    EmptyColumnName {
+        field: &'static str,
+        index: usize,
+    },
+    EmptyHashColumns,
+}
+
+impl MigrationPlanError {
+    fn new(issues: Vec<MigrationPlanIssue>) -> Self {
+        Self { issues }
+    }
+}
+
+impl fmt::Display for MigrationPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "migration plan is not runnable: {}",
+            self.issues
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    }
+}
+
+impl Error for MigrationPlanError {}
+
+impl fmt::Display for MigrationPlanIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTableRef {
+                role,
+                value,
+                reason,
+            } => write!(f, "{role} table reference {value:?} is invalid: {reason}"),
+            Self::MissingKeyColumns => write!(f, "at least one stable key column is required"),
+            Self::EmptyColumnName { field, index } => {
+                write!(f, "{field}[{index}] is empty")
+            }
+            Self::EmptyHashColumns => write!(f, "at least one key or compare column is required"),
+        }
+    }
 }
 
 /// Parse a pasted newline/comma separated column list, preserving first-seen
@@ -462,6 +603,20 @@ pub fn build_migration_plan(spec: &MigrationSpec) -> MigrationPlan {
         diff_sql,
         runbook: build_runbook(&title, &spec, &hash_columns, &warnings, &pair_notes),
     }
+}
+
+#[tracing::instrument(
+    skip_all,
+    fields(
+        source_engine = spec.source_engine.label(),
+        target_engine = spec.target_engine.label(),
+        source_table = %spec.source_table,
+        target_table = %spec.target_table
+    )
+)]
+pub fn try_build_migration_plan(spec: &MigrationSpec) -> Result<MigrationPlan, MigrationPlanError> {
+    validate_migration_spec(spec)?;
+    Ok(build_migration_plan(spec))
 }
 
 #[tracing::instrument(
@@ -1083,7 +1238,7 @@ pub fn row_hash_expression(
     spec: &MigrationSpec,
 ) -> String {
     if columns.is_empty() {
-        return "'configure_compare_columns_before_hashing'".to_string();
+        return unsupported_sql("row hash needs at least one key or compare column");
     }
     let values = columns
         .iter()
@@ -2267,6 +2422,54 @@ fn build_warnings(
     warnings
 }
 
+fn validate_migration_spec(spec: &MigrationSpec) -> Result<(), MigrationPlanError> {
+    let normalized = spec.normalized();
+    let mut issues = Vec::new();
+    validate_table_ref("source", &normalized.source_table, &mut issues);
+    validate_table_ref("target", &normalized.target_table, &mut issues);
+    validate_column_names("key_columns", &normalized.key_columns, &mut issues);
+    validate_column_names("compare_columns", &normalized.compare_columns, &mut issues);
+    if normalized.key_columns.is_empty() {
+        issues.push(MigrationPlanIssue::MissingKeyColumns);
+    }
+    if normalized.key_columns.is_empty() && normalized.compare_columns.is_empty() {
+        issues.push(MigrationPlanIssue::EmptyHashColumns);
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(MigrationPlanError::new(issues))
+    }
+}
+
+fn validate_table_ref(role: &'static str, value: &str, issues: &mut Vec<MigrationPlanIssue>) {
+    match TableRef::parse_dotted(value) {
+        Ok(table) if !table.is_empty() => {}
+        Ok(_) => issues.push(MigrationPlanIssue::InvalidTableRef {
+            role,
+            value: value.to_string(),
+            reason: TableRefParseError::Empty,
+        }),
+        Err(reason) => issues.push(MigrationPlanIssue::InvalidTableRef {
+            role,
+            value: value.to_string(),
+            reason,
+        }),
+    }
+}
+
+fn validate_column_names(
+    field: &'static str,
+    columns: &[String],
+    issues: &mut Vec<MigrationPlanIssue>,
+) {
+    for (index, column) in columns.iter().enumerate() {
+        if column.trim().is_empty() {
+            issues.push(MigrationPlanIssue::EmptyColumnName { field, index });
+        }
+    }
+}
+
 fn build_pair_notes(spec: &MigrationSpec) -> Vec<String> {
     let mut notes = vec![
         "Use an inventory scan before moving data: schema, row counts, partitions, primary keys, nullability, and incompatible types.".to_string(),
@@ -2534,20 +2737,61 @@ fn single_row_limit_clause(engine: MigrationEngine) -> String {
     }
 }
 
-fn string_type(engine: MigrationEngine) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineSqlFamily {
+    Postgres,
+    MySql,
+    Oracle,
+    Snowflake,
+    Hive,
+    DuckDb,
+    Lakehouse,
+    Redshift,
+    Databricks,
+    TrinoPresto,
+}
+
+fn engine_sql_family(engine: MigrationEngine) -> EngineSqlFamily {
     match engine {
-        MigrationEngine::Oracle => "VARCHAR2(4000)",
-        MigrationEngine::MySql | MigrationEngine::MariaDb => "VARCHAR(4000)",
-        MigrationEngine::DuckDb | MigrationEngine::Iceberg | MigrationEngine::S3Tables => "VARCHAR",
-        MigrationEngine::Snowflake => "STRING",
-        _ => "TEXT",
+        MigrationEngine::Postgres => EngineSqlFamily::Postgres,
+        MigrationEngine::MySql | MigrationEngine::MariaDb => EngineSqlFamily::MySql,
+        MigrationEngine::Oracle => EngineSqlFamily::Oracle,
+        MigrationEngine::Snowflake => EngineSqlFamily::Snowflake,
+        MigrationEngine::Hive => EngineSqlFamily::Hive,
+        MigrationEngine::DuckDb => EngineSqlFamily::DuckDb,
+        MigrationEngine::Iceberg | MigrationEngine::S3Tables => EngineSqlFamily::Lakehouse,
+        MigrationEngine::Redshift => EngineSqlFamily::Redshift,
+        MigrationEngine::Databricks => EngineSqlFamily::Databricks,
+        MigrationEngine::TrinoPresto => EngineSqlFamily::TrinoPresto,
+    }
+}
+
+fn string_type(engine: MigrationEngine) -> &'static str {
+    match engine_sql_family(engine) {
+        EngineSqlFamily::Oracle => "VARCHAR2(4000)",
+        EngineSqlFamily::MySql => "VARCHAR(4000)",
+        EngineSqlFamily::DuckDb | EngineSqlFamily::Lakehouse => "VARCHAR",
+        EngineSqlFamily::Snowflake => "STRING",
+        EngineSqlFamily::Postgres
+        | EngineSqlFamily::Hive
+        | EngineSqlFamily::Redshift
+        | EngineSqlFamily::Databricks
+        | EngineSqlFamily::TrinoPresto => "TEXT",
     }
 }
 
 fn integer_type(engine: MigrationEngine) -> &'static str {
-    match engine {
-        MigrationEngine::Oracle => "NUMBER",
-        _ => "BIGINT",
+    match engine_sql_family(engine) {
+        EngineSqlFamily::Oracle => "NUMBER",
+        EngineSqlFamily::Postgres
+        | EngineSqlFamily::MySql
+        | EngineSqlFamily::Snowflake
+        | EngineSqlFamily::Hive
+        | EngineSqlFamily::DuckDb
+        | EngineSqlFamily::Lakehouse
+        | EngineSqlFamily::Redshift
+        | EngineSqlFamily::Databricks
+        | EngineSqlFamily::TrinoPresto => "BIGINT",
     }
 }
 
@@ -2570,98 +2814,182 @@ fn string_ddl_type_for_source(target: MigrationEngine, source_type: &str) -> Str
     let length = type_shape(source_type)
         .and_then(|shape| shape.split(',').next())
         .and_then(|value| value.trim().parse::<u32>().ok());
-    match target {
-        MigrationEngine::Oracle => match length {
+    match engine_sql_family(target) {
+        EngineSqlFamily::Oracle => match length {
             Some(len) if len <= 4000 => format!("VARCHAR2({len})"),
             Some(_) => "CLOB".to_string(),
             None => "CLOB".to_string(),
         },
-        MigrationEngine::MySql | MigrationEngine::MariaDb => match length {
+        EngineSqlFamily::MySql => match length {
             Some(len) if len <= 65_535 => format!("VARCHAR({len})"),
             _ => "TEXT".to_string(),
         },
-        MigrationEngine::Hive | MigrationEngine::Databricks => "STRING".to_string(),
-        MigrationEngine::Snowflake => length
+        EngineSqlFamily::Hive | EngineSqlFamily::Databricks => "STRING".to_string(),
+        EngineSqlFamily::Snowflake => length
             .map(|len| format!("VARCHAR({len})"))
             .unwrap_or_else(|| "STRING".to_string()),
-        _ => length
+        EngineSqlFamily::Postgres
+        | EngineSqlFamily::DuckDb
+        | EngineSqlFamily::Lakehouse
+        | EngineSqlFamily::Redshift
+        | EngineSqlFamily::TrinoPresto => length
             .map(|len| format!("VARCHAR({len})"))
             .unwrap_or_else(|| "TEXT".to_string()),
     }
 }
 
 fn integer_ddl_type(target: MigrationEngine, wide: bool) -> String {
-    match (target, wide) {
-        (MigrationEngine::Oracle, true) => "NUMBER(19,0)".to_string(),
-        (MigrationEngine::Oracle, false) => "NUMBER(10,0)".to_string(),
-        (MigrationEngine::Snowflake, true) => "NUMBER(19,0)".to_string(),
-        (MigrationEngine::Snowflake, false) => "NUMBER(10,0)".to_string(),
-        (_, true) => "BIGINT".to_string(),
-        (_, false) => "INTEGER".to_string(),
+    match (engine_sql_family(target), wide) {
+        (EngineSqlFamily::Oracle | EngineSqlFamily::Snowflake, true) => "NUMBER(19,0)".to_string(),
+        (EngineSqlFamily::Oracle | EngineSqlFamily::Snowflake, false) => "NUMBER(10,0)".to_string(),
+        (
+            EngineSqlFamily::Postgres
+            | EngineSqlFamily::MySql
+            | EngineSqlFamily::Hive
+            | EngineSqlFamily::DuckDb
+            | EngineSqlFamily::Lakehouse
+            | EngineSqlFamily::Redshift
+            | EngineSqlFamily::Databricks
+            | EngineSqlFamily::TrinoPresto,
+            true,
+        ) => "BIGINT".to_string(),
+        (
+            EngineSqlFamily::Postgres
+            | EngineSqlFamily::MySql
+            | EngineSqlFamily::Hive
+            | EngineSqlFamily::DuckDb
+            | EngineSqlFamily::Lakehouse
+            | EngineSqlFamily::Redshift
+            | EngineSqlFamily::Databricks
+            | EngineSqlFamily::TrinoPresto,
+            false,
+        ) => "INTEGER".to_string(),
     }
 }
 
 fn decimal_ddl_type(target: MigrationEngine, source_type: &str) -> String {
     let shape = type_shape(source_type).unwrap_or("38,10");
-    match target {
-        MigrationEngine::Oracle | MigrationEngine::Snowflake => format!("NUMBER({shape})"),
-        _ => format!("DECIMAL({shape})"),
+    match engine_sql_family(target) {
+        EngineSqlFamily::Oracle | EngineSqlFamily::Snowflake => format!("NUMBER({shape})"),
+        EngineSqlFamily::Postgres
+        | EngineSqlFamily::MySql
+        | EngineSqlFamily::Hive
+        | EngineSqlFamily::DuckDb
+        | EngineSqlFamily::Lakehouse
+        | EngineSqlFamily::Redshift
+        | EngineSqlFamily::Databricks
+        | EngineSqlFamily::TrinoPresto => format!("DECIMAL({shape})"),
     }
 }
 
 fn float_ddl_type(target: MigrationEngine, double: bool) -> String {
-    match (target, double) {
-        (MigrationEngine::Oracle, true) => "BINARY_DOUBLE".to_string(),
-        (MigrationEngine::Oracle, false) => "BINARY_FLOAT".to_string(),
-        (_, true) => "DOUBLE PRECISION".to_string(),
-        (_, false) => "REAL".to_string(),
+    match (engine_sql_family(target), double) {
+        (EngineSqlFamily::Oracle, true) => "BINARY_DOUBLE".to_string(),
+        (EngineSqlFamily::Oracle, false) => "BINARY_FLOAT".to_string(),
+        (
+            EngineSqlFamily::Postgres
+            | EngineSqlFamily::MySql
+            | EngineSqlFamily::Snowflake
+            | EngineSqlFamily::Hive
+            | EngineSqlFamily::DuckDb
+            | EngineSqlFamily::Lakehouse
+            | EngineSqlFamily::Redshift
+            | EngineSqlFamily::Databricks
+            | EngineSqlFamily::TrinoPresto,
+            true,
+        ) => "DOUBLE PRECISION".to_string(),
+        (
+            EngineSqlFamily::Postgres
+            | EngineSqlFamily::MySql
+            | EngineSqlFamily::Snowflake
+            | EngineSqlFamily::Hive
+            | EngineSqlFamily::DuckDb
+            | EngineSqlFamily::Lakehouse
+            | EngineSqlFamily::Redshift
+            | EngineSqlFamily::Databricks
+            | EngineSqlFamily::TrinoPresto,
+            false,
+        ) => "REAL".to_string(),
     }
 }
 
 fn boolean_ddl_type(target: MigrationEngine) -> String {
-    match target {
-        MigrationEngine::Oracle => "NUMBER(1,0)".to_string(),
-        _ => "BOOLEAN".to_string(),
+    match engine_sql_family(target) {
+        EngineSqlFamily::Oracle => "NUMBER(1,0)".to_string(),
+        EngineSqlFamily::Postgres
+        | EngineSqlFamily::MySql
+        | EngineSqlFamily::Snowflake
+        | EngineSqlFamily::Hive
+        | EngineSqlFamily::DuckDb
+        | EngineSqlFamily::Lakehouse
+        | EngineSqlFamily::Redshift
+        | EngineSqlFamily::Databricks
+        | EngineSqlFamily::TrinoPresto => "BOOLEAN".to_string(),
     }
 }
 
 fn timestamp_ddl_type(target: MigrationEngine) -> String {
-    match target {
-        MigrationEngine::Snowflake => "TIMESTAMP_NTZ".to_string(),
-        _ => "TIMESTAMP".to_string(),
+    match engine_sql_family(target) {
+        EngineSqlFamily::Snowflake => "TIMESTAMP_NTZ".to_string(),
+        EngineSqlFamily::Postgres
+        | EngineSqlFamily::MySql
+        | EngineSqlFamily::Oracle
+        | EngineSqlFamily::Hive
+        | EngineSqlFamily::DuckDb
+        | EngineSqlFamily::Lakehouse
+        | EngineSqlFamily::Redshift
+        | EngineSqlFamily::Databricks
+        | EngineSqlFamily::TrinoPresto => "TIMESTAMP".to_string(),
     }
 }
 
 fn bytes_ddl_type(target: MigrationEngine) -> String {
-    match target {
-        MigrationEngine::Postgres | MigrationEngine::Redshift => "BYTEA".to_string(),
-        MigrationEngine::Oracle => "BLOB".to_string(),
-        MigrationEngine::Snowflake => "BINARY".to_string(),
-        MigrationEngine::MySql | MigrationEngine::MariaDb => "BLOB".to_string(),
-        _ => "VARBINARY".to_string(),
+    match engine_sql_family(target) {
+        EngineSqlFamily::Postgres | EngineSqlFamily::Redshift => "BYTEA".to_string(),
+        EngineSqlFamily::Oracle | EngineSqlFamily::MySql => "BLOB".to_string(),
+        EngineSqlFamily::Snowflake => "BINARY".to_string(),
+        EngineSqlFamily::Hive
+        | EngineSqlFamily::DuckDb
+        | EngineSqlFamily::Lakehouse
+        | EngineSqlFamily::Databricks
+        | EngineSqlFamily::TrinoPresto => "VARBINARY".to_string(),
     }
 }
 
 fn uuid_ddl_type(target: MigrationEngine) -> String {
-    match target {
-        MigrationEngine::Postgres | MigrationEngine::DuckDb => "UUID".to_string(),
-        _ => "VARCHAR(36)".to_string(),
+    match engine_sql_family(target) {
+        EngineSqlFamily::Postgres | EngineSqlFamily::DuckDb => "UUID".to_string(),
+        EngineSqlFamily::MySql
+        | EngineSqlFamily::Oracle
+        | EngineSqlFamily::Snowflake
+        | EngineSqlFamily::Hive
+        | EngineSqlFamily::Lakehouse
+        | EngineSqlFamily::Redshift
+        | EngineSqlFamily::Databricks
+        | EngineSqlFamily::TrinoPresto => "VARCHAR(36)".to_string(),
     }
 }
 
 fn json_ddl_type(target: MigrationEngine) -> String {
-    match target {
-        MigrationEngine::Postgres => "JSONB".to_string(),
-        MigrationEngine::MySql | MigrationEngine::MariaDb => "JSON".to_string(),
-        MigrationEngine::Snowflake => "VARIANT".to_string(),
-        MigrationEngine::Oracle => "CLOB".to_string(),
-        MigrationEngine::Hive | MigrationEngine::Databricks => "STRING".to_string(),
-        _ => "JSON".to_string(),
+    match engine_sql_family(target) {
+        EngineSqlFamily::Postgres => "JSONB".to_string(),
+        EngineSqlFamily::MySql
+        | EngineSqlFamily::DuckDb
+        | EngineSqlFamily::Lakehouse
+        | EngineSqlFamily::Redshift
+        | EngineSqlFamily::TrinoPresto => "JSON".to_string(),
+        EngineSqlFamily::Snowflake => "VARIANT".to_string(),
+        EngineSqlFamily::Oracle => "CLOB".to_string(),
+        EngineSqlFamily::Hive | EngineSqlFamily::Databricks => "STRING".to_string(),
     }
 }
 
 fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn unsupported_sql(reason: &str) -> String {
+    format!("IRODORI_UNSUPPORTED_SQL({})", sql_string(reason))
 }
 
 fn statement(sql: &str) -> String {
@@ -2815,6 +3143,57 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("mixing engine-native hash algorithms")));
+    }
+
+    #[test]
+    fn try_build_migration_plan_returns_typed_errors_for_unrunnable_specs() {
+        let spec = MigrationSpec::new(
+            MigrationEngine::Postgres,
+            MigrationEngine::MySql,
+            "",
+            "a..b",
+        )
+        .with_key_columns(vec![])
+        .with_compare_columns(vec![]);
+
+        let error = try_build_migration_plan(&spec).expect_err("unrunnable");
+
+        assert!(error
+            .issues
+            .iter()
+            .any(|issue| matches!(issue, MigrationPlanIssue::MissingKeyColumns)));
+        assert!(error.issues.iter().any(|issue| {
+            matches!(
+                issue,
+                MigrationPlanIssue::InvalidTableRef {
+                    role: "source",
+                    reason: TableRefParseError::Empty,
+                    ..
+                }
+            )
+        }));
+        assert!(error.to_string().contains("not runnable"));
+    }
+
+    #[test]
+    fn migration_spec_builder_produces_runnable_plan() {
+        let spec = MigrationSpec::new(
+            MigrationEngine::Postgres,
+            MigrationEngine::MySql,
+            "public.orders",
+            "warehouse.orders",
+        )
+        .with_key_columns(vec!["id".to_string()])
+        .with_compare_columns(vec!["id".to_string(), "amount".to_string()])
+        .with_partition("", "")
+        .with_batch_size(2_500)
+        .with_diff_limit(50);
+
+        let plan = try_build_migration_plan(&spec).expect("plan");
+
+        assert_eq!(plan.keys, vec!["id".to_string()]);
+        assert!(plan.source_sql.contains("batch_size=2500"));
+        assert!(plan.diff_sql.contains("LIMIT 50"));
     }
 
     #[test]
@@ -3049,5 +3428,13 @@ mod tests {
         let sql = keyed_diff_sql(MigrationEngine::Snowflake, &[], 10);
 
         assert!(sql.contains("stable business key"));
+    }
+
+    #[test]
+    fn row_hash_empty_columns_fail_closed() {
+        let sql = row_hash_expression(MigrationEngine::Postgres, &[], &MigrationSpec::default());
+
+        assert!(sql.contains("IRODORI_UNSUPPORTED_SQL"));
+        assert!(!sql.contains("configure_compare_columns_before_hashing"));
     }
 }

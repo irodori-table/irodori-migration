@@ -12,7 +12,8 @@ const DEFAULT_PROGRESS_EVERY_ROWS: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportConfig {
-    /// Report progress and check cancellation every this many rows.
+    /// Report progress every this many rows. Cancellation is checked before each
+    /// row so hosts can bridge an async cancellation token with an AtomicBool.
     pub progress_every_rows: u64,
 }
 
@@ -61,16 +62,16 @@ where
     let mut cancelled = false;
 
     for row in rows {
+        if control.should_cancel() {
+            cancelled = true;
+            break;
+        }
         let cells: Vec<Cell<'_>> = row.iter().map(cell_ref).collect();
         encoder.write_row(&cells)?;
         rows_written += 1;
 
         if rows_written.is_multiple_of(progress_every) {
             control.progress(rows_written)?;
-            if control.should_cancel() {
-                cancelled = true;
-                break;
-            }
         }
     }
 

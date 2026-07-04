@@ -24,7 +24,8 @@ pub use canonical::{
 pub use checksum::{
     build_sync_repair_plan, checksum_diff_sql, checksum_manifest_table_sql,
     chunk_checksum_select_sql, pt_table_checksum_model, AdaptiveChunking, ChecksumAggregate,
-    ChecksumFunction, ChunkBounds, ChunkChecksumConfig, SyncAlgorithm, SyncRepairPlan,
+    ChecksumFunction, ChunkBounds, ChunkChecksumConfig, SyncAlgorithm, SyncRepairAction,
+    SyncRepairPlan, SyncRepairTemplate,
 };
 pub use export::{export_rows, ExportConfig, ExportControl, ExportReport};
 pub use io::{
@@ -41,10 +42,11 @@ pub use plan::{
     hash_bucket_diff_sql, hash_bucket_fingerprint_sql, key_hash_expression, key_hash_profile_sql,
     keyed_diff_sql, manifest_table_sql, map_column_type, parse_column_list,
     partition_fingerprint_sql, row_hash_expression, row_hash_select_sql, target_table_ddl_sql,
-    vscode_snippet_body, ChunkIterationConfig, ColumnTypeMapping, ForeignKeyLoadOrder,
-    ForeignKeySpec, MigrationCheckpointConfig, MigrationEngine, MigrationExportFormat,
-    MigrationPlan, MigrationSnippet, MigrationSnippetKind, MigrationSnippetVariable, MigrationSpec,
-    MigrationTask, MigrationTaskLevel, SourceColumnSpec,
+    try_build_migration_plan, vscode_snippet_body, ChunkIterationConfig, ColumnTypeMapping,
+    ForeignKeyLoadOrder, ForeignKeySpec, MigrationCheckpointConfig, MigrationEngine,
+    MigrationExportFormat, MigrationPlan, MigrationPlanError, MigrationPlanIssue, MigrationSnippet,
+    MigrationSnippetKind, MigrationSnippetVariable, MigrationSpec, MigrationTask,
+    MigrationTaskLevel, SourceColumnSpec,
 };
 pub use recipe::{
     dry_run_text_recipe, recipe_run_summary, MigrationRecipe, RecipePhase, RecipePreview,
@@ -60,6 +62,7 @@ pub use schema::{
     PrimaryKeyChange, Rename, RenameHint, Schema, SchemaDiff, Table, TableConstraint,
     UniqueConstraint, UnsupportedMigration,
 };
+pub use sql_ref::{TableRef, TableRefParseError};
 
 #[cfg(feature = "avro")]
 pub use io::AvroEncoder;
