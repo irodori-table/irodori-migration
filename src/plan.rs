@@ -593,7 +593,13 @@ pub fn chunk_iteration_sql(engine: MigrationEngine, config: &ChunkIterationConfi
     let batch_size = config.batch_size.clamp(1_000, 100_000_000);
     let key_projection = keys
         .iter()
-        .map(|key| format!("    {} AS {}", column_ref(engine, key), identifier_ref(engine, key)))
+        .map(|key| {
+            format!(
+                "    {} AS {}",
+                column_ref(engine, key),
+                identifier_ref(engine, key)
+            )
+        })
         .collect::<Vec<_>>()
         .join(",\n");
     let source_order = keys
@@ -686,9 +692,13 @@ pub fn checkpoint_table_sql(engine: MigrationEngine, table: &str) -> String {
     .join("\n")
 }
 
-pub fn checkpoint_resume_sql(engine: MigrationEngine, config: &MigrationCheckpointConfig) -> String {
+pub fn checkpoint_resume_sql(
+    engine: MigrationEngine,
+    config: &MigrationCheckpointConfig,
+) -> String {
     [
-        "-- Resume cursor: pick the first chunk that has not reached a completed checkpoint.",
+        "-- Resume cursor: pick the first chunk that has not reached a completed checkpoint."
+            .to_string(),
         "SELECT".to_string(),
         "  c.chunk_id,".to_string(),
         "  c.lower_boundary,".to_string(),
@@ -719,7 +729,8 @@ pub fn checkpoint_mark_completed_sql(
     config: &MigrationCheckpointConfig,
 ) -> String {
     [
-        "-- Mark a chunk completed after source/target counts and checksum/hash gates pass.",
+        "-- Mark a chunk completed after source/target counts and checksum/hash gates pass."
+            .to_string(),
         format!(
             "DELETE FROM {}\nWHERE migration_id = {}\n  AND table_name = {}\n  AND chunk_id = '${{IRODORI_CHUNK_ID}}';",
             table_ref(engine, &config.checkpoint_table),
@@ -863,7 +874,10 @@ pub fn map_column_type(
         || normalized.starts_with("time ")
         || normalized == "time"
     {
-        if matches!(source_engine, MigrationEngine::Oracle | MigrationEngine::MySql) {
+        if matches!(
+            source_engine,
+            MigrationEngine::Oracle | MigrationEngine::MySql
+        ) {
             warnings.push(
                 "Timestamp timezone/session semantics need explicit validation before cutover."
                     .to_string(),
@@ -896,7 +910,9 @@ pub fn map_column_type(
     } else if normalized.contains("int") {
         if normalized.contains("unsigned") {
             lossy = true;
-            warnings.push("Unsigned integer range needs explicit target bounds validation.".to_string());
+            warnings.push(
+                "Unsigned integer range needs explicit target bounds validation.".to_string(),
+            );
         }
         integer_ddl_type(target_engine, false)
     } else if normalized.contains("double")
@@ -934,7 +950,8 @@ pub fn target_table_ddl_sql(
     columns: &[SourceColumnSpec],
 ) -> String {
     if columns.is_empty() {
-        return "-- Target DDL needs source inventory columns before it can be generated.".to_string();
+        return "-- Target DDL needs source inventory columns before it can be generated."
+            .to_string();
     }
 
     let mut warnings = Vec::new();
@@ -964,15 +981,16 @@ pub fn target_table_ddl_sql(
         })
         .collect::<Vec<_>>();
 
-    let mut lines = vec![
-        format!(
-            "-- Target DDL generated from {} inventory for {}.",
-            source_engine.label(),
-            target_engine.label()
-        ),
-    ];
+    let mut lines = vec![format!(
+        "-- Target DDL generated from {} inventory for {}.",
+        source_engine.label(),
+        target_engine.label()
+    )];
     lines.extend(warnings);
-    lines.push(format!("CREATE TABLE {} (", table_ref(target_engine, target_table)));
+    lines.push(format!(
+        "CREATE TABLE {} (",
+        table_ref(target_engine, target_table)
+    ));
     lines.push(definitions.join(",\n"));
     lines.push(");".to_string());
     lines.join("\n")

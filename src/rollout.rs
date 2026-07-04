@@ -51,9 +51,7 @@ impl MigrationValidationSummary {
     }
 
     pub fn passes_cutover_gates(&self) -> bool {
-        self.passes_checksum_gates()
-            && self.row_diff_count == 0
-            && self.shadow_mismatch_count == 0
+        self.passes_checksum_gates() && self.row_diff_count == 0 && self.shadow_mismatch_count == 0
     }
 }
 

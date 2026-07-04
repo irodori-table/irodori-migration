@@ -54,12 +54,81 @@ pub struct Index {
     pub unique: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyConstraint {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
+    pub on_delete: Option<String>,
+    pub on_update: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConstraint {
+    pub name: String,
+    pub expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniqueConstraint {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableConstraint {
+    ForeignKey(ForeignKeyConstraint),
+    Check(CheckConstraint),
+    Unique(UniqueConstraint),
+}
+
+impl TableConstraint {
+    pub fn name(&self) -> &str {
+        match self {
+            TableConstraint::ForeignKey(constraint) => &constraint.name,
+            TableConstraint::Check(constraint) => &constraint.name,
+            TableConstraint::Unique(constraint) => &constraint.name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rename {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameHint {
+    Table {
+        from: String,
+        to: String,
+    },
+    Column {
+        table: String,
+        from: String,
+        to: String,
+    },
+    Index {
+        table: String,
+        from: String,
+        to: String,
+    },
+    Constraint {
+        table: String,
+        from: String,
+        to: String,
+    },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
     pub primary_key: Vec<String>,
     pub indexes: Vec<Index>,
+    pub constraints: Vec<TableConstraint>,
 }
 
 impl Table {
@@ -85,6 +154,11 @@ impl Table {
         self
     }
 
+    pub fn with_constraints(mut self, constraints: Vec<TableConstraint>) -> Self {
+        self.constraints = constraints;
+        self
+    }
+
     fn column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
     }
@@ -92,20 +166,49 @@ impl Table {
     fn index(&self, name: &str) -> Option<&Index> {
         self.indexes.iter().find(|i| i.name == name)
     }
+
+    fn constraint(&self, name: &str) -> Option<&TableConstraint> {
+        self.constraints
+            .iter()
+            .find(|constraint| constraint.name() == name)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Schema {
     pub tables: Vec<Table>,
+    pub rename_hints: Vec<RenameHint>,
 }
 
 impl Schema {
     pub fn new(tables: Vec<Table>) -> Self {
-        Self { tables }
+        Self {
+            tables,
+            rename_hints: Vec::new(),
+        }
+    }
+
+    pub fn with_rename_hints(mut self, rename_hints: Vec<RenameHint>) -> Self {
+        self.rename_hints = rename_hints;
+        self
     }
 
     fn table(&self, name: &str) -> Option<&Table> {
         self.tables.iter().find(|t| t.name == name)
+    }
+
+    fn table_rename_from(&self, to: &str) -> Option<&str> {
+        self.rename_hints.iter().find_map(|hint| match hint {
+            RenameHint::Table { from, to: target } if target == to => Some(from.as_str()),
+            _ => None,
+        })
+    }
+
+    fn table_rename_to(&self, from: &str) -> Option<&str> {
+        self.rename_hints.iter().find_map(|hint| match hint {
+            RenameHint::Table { from: source, to } if source == from => Some(to.as_str()),
+            _ => None,
+        })
     }
 }
 
@@ -136,22 +239,56 @@ pub struct AlteredColumn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimaryKeyChange {
+    pub from: Vec<String>,
+    pub to: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlteredTable {
     pub name: String,
+    pub renamed_from: Option<String>,
+    pub renamed_columns: Vec<Rename>,
     pub added_columns: Vec<Column>,
     pub dropped_columns: Vec<String>,
     pub altered_columns: Vec<AlteredColumn>,
+    pub primary_key_change: Option<PrimaryKeyChange>,
+    pub renamed_indexes: Vec<Rename>,
     pub added_indexes: Vec<Index>,
     pub dropped_indexes: Vec<String>,
+    pub renamed_constraints: Vec<Rename>,
+    pub added_constraints: Vec<TableConstraint>,
+    pub dropped_constraints: Vec<TableConstraint>,
 }
 
 impl AlteredTable {
     fn is_empty(&self) -> bool {
-        self.added_columns.is_empty()
+        self.renamed_from.is_none()
+            && self.renamed_columns.is_empty()
+            && self.added_columns.is_empty()
             && self.dropped_columns.is_empty()
             && self.altered_columns.is_empty()
+            && self.primary_key_change.is_none()
+            && self.renamed_indexes.is_empty()
             && self.added_indexes.is_empty()
             && self.dropped_indexes.is_empty()
+            && self.renamed_constraints.is_empty()
+            && self.added_constraints.is_empty()
+            && self.dropped_constraints.is_empty()
+    }
+
+    fn has_destructive_changes(&self) -> bool {
+        !self.dropped_columns.is_empty()
+            || !self.dropped_indexes.is_empty()
+            || self
+                .altered_columns
+                .iter()
+                .any(|column| column.changes.iter().any(ColumnChange::is_destructive))
+            || self
+                .primary_key_change
+                .as_ref()
+                .is_some_and(|change| !change.from.is_empty() && change.from != change.to)
+            || !self.dropped_constraints.is_empty()
     }
 }
 
@@ -169,13 +306,13 @@ impl SchemaDiff {
             && self.altered_tables.is_empty()
     }
 
-    /// Whether the diff drops a table, column, or index (data-losing changes).
+    /// Whether the diff contains a destructive or safety-lowering change.
     pub fn has_destructive_changes(&self) -> bool {
         !self.dropped_tables.is_empty()
             || self
                 .altered_tables
                 .iter()
-                .any(|table| !table.dropped_columns.is_empty() || !table.dropped_indexes.is_empty())
+                .any(AlteredTable::has_destructive_changes)
     }
 
     /// A short, human-readable change set for the preview header.
@@ -207,6 +344,15 @@ impl SchemaDiff {
             if !table.dropped_indexes.is_empty() {
                 bits.push(format!("-{}idx", table.dropped_indexes.len()));
             }
+            if table.primary_key_change.is_some() {
+                bits.push("~pk".to_string());
+            }
+            if !table.added_constraints.is_empty() {
+                bits.push(format!("+{}constraint", table.added_constraints.len()));
+            }
+            if !table.dropped_constraints.is_empty() {
+                bits.push(format!("-{}constraint", table.dropped_constraints.len()));
+            }
             parts.push(format!("{} ({})", table.name, bits.join(", ")));
         }
         parts.join("; ")
@@ -218,18 +364,35 @@ pub fn diff_schemas(old: &Schema, new: &Schema) -> SchemaDiff {
     let mut diff = SchemaDiff::default();
 
     for new_table in &new.tables {
-        if old.table(&new_table.name).is_none() {
+        if old.table(&new_table.name).is_none()
+            && new
+                .table_rename_from(&new_table.name)
+                .and_then(|old_name| old.table(old_name))
+                .is_none()
+        {
             diff.added_tables.push(new_table.clone());
         }
     }
     for old_table in &old.tables {
-        if new.table(&old_table.name).is_none() {
+        if new.table(&old_table.name).is_none()
+            && new
+                .table_rename_to(&old_table.name)
+                .and_then(|new_name| new.table(new_name))
+                .is_none()
+        {
             diff.dropped_tables.push(old_table.name.clone());
         }
     }
     for new_table in &new.tables {
-        if let Some(old_table) = old.table(&new_table.name) {
-            let altered = diff_table(old_table, new_table);
+        let old_table = old.table(&new_table.name).or_else(|| {
+            new.table_rename_from(&new_table.name)
+                .and_then(|old_name| old.table(old_name))
+        });
+        if let Some(old_table) = old_table {
+            let mut altered = diff_table(old_table, new_table, &new.rename_hints);
+            if old_table.name != new_table.name {
+                altered.renamed_from = Some(old_table.name.clone());
+            }
             if !altered.is_empty() {
                 diff.altered_tables.push(altered);
             }
@@ -238,14 +401,21 @@ pub fn diff_schemas(old: &Schema, new: &Schema) -> SchemaDiff {
     diff
 }
 
-fn diff_table(old: &Table, new: &Table) -> AlteredTable {
+fn diff_table(old: &Table, new: &Table, rename_hints: &[RenameHint]) -> AlteredTable {
     let mut altered = AlteredTable {
         name: new.name.clone(),
+        renamed_from: None,
+        renamed_columns: Vec::new(),
         added_columns: Vec::new(),
         dropped_columns: Vec::new(),
         altered_columns: Vec::new(),
+        primary_key_change: None,
+        renamed_indexes: Vec::new(),
         added_indexes: Vec::new(),
         dropped_indexes: Vec::new(),
+        renamed_constraints: Vec::new(),
+        added_constraints: Vec::new(),
+        dropped_constraints: Vec::new(),
     };
 
     for new_column in &new.columns {
@@ -262,10 +432,43 @@ fn diff_table(old: &Table, new: &Table) -> AlteredTable {
             }
         }
     }
+    for new_column in &new.columns {
+        if old.column(&new_column.name).is_some() {
+            continue;
+        }
+        if let Some(old_name) =
+            rename_from(rename_hints, RenameKind::Column, old, new, &new_column.name)
+        {
+            if let Some(old_column) = old.column(old_name) {
+                altered
+                    .added_columns
+                    .retain(|column| column.name != new_column.name);
+                altered.renamed_columns.push(Rename {
+                    from: old_name.to_string(),
+                    to: new_column.name.clone(),
+                });
+                let changes = diff_column(old_column, new_column);
+                if !changes.is_empty() {
+                    altered.altered_columns.push(AlteredColumn {
+                        column: new_column.clone(),
+                        changes,
+                    });
+                }
+            }
+        }
+    }
     for old_column in &old.columns {
-        if new.column(&old_column.name).is_none() {
+        if new.column(&old_column.name).is_none()
+            && rename_to(rename_hints, RenameKind::Column, old, new, &old_column.name).is_none()
+        {
             altered.dropped_columns.push(old_column.name.clone());
         }
+    }
+    if old.primary_key != new.primary_key {
+        altered.primary_key_change = Some(PrimaryKeyChange {
+            from: old.primary_key.clone(),
+            to: new.primary_key.clone(),
+        });
     }
     for new_index in &new.indexes {
         match old.index(&new_index.name) {
@@ -280,12 +483,182 @@ fn diff_table(old: &Table, new: &Table) -> AlteredTable {
             None => altered.added_indexes.push(new_index.clone()),
         }
     }
+    for new_index in &new.indexes {
+        if old.index(&new_index.name).is_some() {
+            continue;
+        }
+        if let Some(old_name) =
+            rename_from(rename_hints, RenameKind::Index, old, new, &new_index.name)
+        {
+            if let Some(old_index) = old.index(old_name) {
+                altered
+                    .added_indexes
+                    .retain(|index| index.name != new_index.name);
+                altered.renamed_indexes.push(Rename {
+                    from: old_name.to_string(),
+                    to: new_index.name.clone(),
+                });
+                if old_index.columns != new_index.columns || old_index.unique != new_index.unique {
+                    altered.dropped_indexes.push(new_index.name.clone());
+                    altered.added_indexes.push(new_index.clone());
+                }
+            }
+        }
+    }
     for old_index in &old.indexes {
-        if new.index(&old_index.name).is_none() {
+        if new.index(&old_index.name).is_none()
+            && rename_to(rename_hints, RenameKind::Index, old, new, &old_index.name).is_none()
+        {
             altered.dropped_indexes.push(old_index.name.clone());
         }
     }
+    for new_constraint in &new.constraints {
+        match old.constraint(new_constraint.name()) {
+            Some(existing) if existing == new_constraint => {}
+            Some(existing) => {
+                altered.dropped_constraints.push(existing.clone());
+                altered.added_constraints.push(new_constraint.clone());
+            }
+            None => altered.added_constraints.push(new_constraint.clone()),
+        }
+    }
+    for new_constraint in &new.constraints {
+        if old.constraint(new_constraint.name()).is_some() {
+            continue;
+        }
+        if let Some(old_name) = rename_from(
+            rename_hints,
+            RenameKind::Constraint,
+            old,
+            new,
+            new_constraint.name(),
+        ) {
+            if let Some(old_constraint) = old.constraint(old_name) {
+                altered
+                    .added_constraints
+                    .retain(|constraint| constraint.name() != new_constraint.name());
+                altered.renamed_constraints.push(Rename {
+                    from: old_name.to_string(),
+                    to: new_constraint.name().to_string(),
+                });
+                if !same_constraint_body(old_constraint, new_constraint) {
+                    altered.dropped_constraints.push(new_constraint.clone());
+                    altered.added_constraints.push(new_constraint.clone());
+                }
+            }
+        }
+    }
+    for old_constraint in &old.constraints {
+        if new.constraint(old_constraint.name()).is_none()
+            && rename_to(
+                rename_hints,
+                RenameKind::Constraint,
+                old,
+                new,
+                old_constraint.name(),
+            )
+            .is_none()
+        {
+            altered.dropped_constraints.push(old_constraint.clone());
+        }
+    }
     altered
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameKind {
+    Column,
+    Index,
+    Constraint,
+}
+
+fn rename_from<'a>(
+    hints: &'a [RenameHint],
+    kind: RenameKind,
+    old: &Table,
+    new: &Table,
+    to: &str,
+) -> Option<&'a str> {
+    hints.iter().find_map(|hint| match (kind, hint) {
+        (
+            RenameKind::Column,
+            RenameHint::Column {
+                table,
+                from,
+                to: target,
+            },
+        )
+        | (
+            RenameKind::Index,
+            RenameHint::Index {
+                table,
+                from,
+                to: target,
+            },
+        )
+        | (
+            RenameKind::Constraint,
+            RenameHint::Constraint {
+                table,
+                from,
+                to: target,
+            },
+        ) if target == to && (table == &old.name || table == &new.name) => Some(from.as_str()),
+        _ => None,
+    })
+}
+
+fn rename_to<'a>(
+    hints: &'a [RenameHint],
+    kind: RenameKind,
+    old: &Table,
+    new: &Table,
+    from: &str,
+) -> Option<&'a str> {
+    hints.iter().find_map(|hint| match (kind, hint) {
+        (
+            RenameKind::Column,
+            RenameHint::Column {
+                table,
+                from: source,
+                to,
+            },
+        )
+        | (
+            RenameKind::Index,
+            RenameHint::Index {
+                table,
+                from: source,
+                to,
+            },
+        )
+        | (
+            RenameKind::Constraint,
+            RenameHint::Constraint {
+                table,
+                from: source,
+                to,
+            },
+        ) if source == from && (table == &old.name || table == &new.name) => Some(to.as_str()),
+        _ => None,
+    })
+}
+
+fn same_constraint_body(old: &TableConstraint, new: &TableConstraint) -> bool {
+    match (old, new) {
+        (TableConstraint::ForeignKey(old), TableConstraint::ForeignKey(new)) => {
+            old.columns == new.columns
+                && old.referenced_table == new.referenced_table
+                && old.referenced_columns == new.referenced_columns
+                && old.on_delete == new.on_delete
+                && old.on_update == new.on_update
+        }
+        (TableConstraint::Check(old), TableConstraint::Check(new)) => {
+            old.expression == new.expression
+        }
+        (TableConstraint::Unique(old), TableConstraint::Unique(new)) => old.columns == new.columns,
+        _ => false,
+    }
 }
 
 fn diff_column(old: &Column, new: &Column) -> Vec<ColumnChange> {
@@ -310,6 +683,153 @@ fn diff_column(old: &Column, new: &Column) -> Vec<ColumnChange> {
     changes
 }
 
+impl ColumnChange {
+    fn is_destructive(&self) -> bool {
+        match self {
+            ColumnChange::Type { from, to } => is_type_narrowing(from, to),
+            ColumnChange::Nullability { nullable } => !nullable,
+            ColumnChange::Default { .. } => false,
+        }
+    }
+}
+
+fn is_type_narrowing(from: &str, to: &str) -> bool {
+    let from = TypeShape::parse(from);
+    let to = TypeShape::parse(to);
+    match (&from.kind, &to.kind) {
+        (TypeKind::String, TypeKind::String) => match (from.width, to.width) {
+            (_, None) => false,
+            (Some(from_width), Some(to_width)) => to_width < from_width,
+            (None, Some(_)) => true,
+        },
+        (TypeKind::Integer, TypeKind::Integer)
+        | (TypeKind::Decimal, TypeKind::Decimal)
+        | (TypeKind::Float, TypeKind::Float) => {
+            let rank_narrowed = to.rank < from.rank;
+            let width_narrowed = match (from.width, to.width) {
+                (Some(from_width), Some(to_width)) => to_width < from_width,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            let scale_narrowed = match (from.scale, to.scale) {
+                (Some(from_scale), Some(to_scale)) => to_scale < from_scale,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            rank_narrowed || width_narrowed || scale_narrowed
+        }
+        (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
+        (from_kind, to_kind) => from_kind != to_kind,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypeShape {
+    kind: TypeKind,
+    rank: u8,
+    width: Option<u32>,
+    scale: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeKind {
+    String,
+    Integer,
+    Decimal,
+    Float,
+    Boolean,
+    Temporal,
+    Binary,
+    Unknown,
+}
+
+impl TypeShape {
+    fn parse(raw: &str) -> Self {
+        let normalized = raw.trim().to_ascii_lowercase();
+        let base = normalized
+            .split_once('(')
+            .map(|(base, _)| base.trim())
+            .unwrap_or(normalized.trim())
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        let args = type_args(&normalized);
+        match base {
+            "char" | "character" | "nchar" => Self::string(args.first().copied()),
+            "varchar" | "character varying" | "nvarchar" => Self::string(args.first().copied()),
+            "text" | "tinytext" | "mediumtext" | "longtext" | "clob" => Self::string(None),
+            "tinyint" => Self::integer(1),
+            "smallint" | "int2" => Self::integer(2),
+            "mediumint" => Self::integer(3),
+            "integer" | "int" | "int4" | "serial" => Self::integer(4),
+            "bigint" | "int8" | "bigserial" => Self::integer(8),
+            "numeric" | "decimal" | "number" => Self {
+                kind: TypeKind::Decimal,
+                rank: 0,
+                width: args.first().copied(),
+                scale: args.get(1).copied(),
+            },
+            "real" | "float4" => Self::float(4),
+            "double" | "float8" => Self::float(8),
+            "float" => Self::float(args.first().copied().unwrap_or(8)),
+            "bool" | "boolean" => Self::simple(TypeKind::Boolean),
+            "date" | "time" | "timestamp" | "timestamptz" | "datetime" => {
+                Self::simple(TypeKind::Temporal)
+            }
+            "bytea" | "blob" | "binary" | "varbinary" => Self::simple(TypeKind::Binary),
+            _ => Self::simple(TypeKind::Unknown),
+        }
+    }
+
+    fn simple(kind: TypeKind) -> Self {
+        Self {
+            kind,
+            rank: 0,
+            width: None,
+            scale: None,
+        }
+    }
+
+    fn string(width: Option<u32>) -> Self {
+        Self {
+            kind: TypeKind::String,
+            rank: 0,
+            width,
+            scale: None,
+        }
+    }
+
+    fn integer(rank: u8) -> Self {
+        Self {
+            kind: TypeKind::Integer,
+            rank,
+            width: None,
+            scale: None,
+        }
+    }
+
+    fn float(rank: u32) -> Self {
+        Self {
+            kind: TypeKind::Float,
+            rank: rank.min(u8::MAX as u32) as u8,
+            width: None,
+            scale: None,
+        }
+    }
+}
+
+fn type_args(normalized: &str) -> Vec<u32> {
+    normalized
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')').map(|(args, _)| args))
+        .map(|args| {
+            args.split(',')
+                .filter_map(|arg| arg.trim().parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Migration preview
 // ---------------------------------------------------------------------------
@@ -325,22 +845,33 @@ pub enum AlterColumnStyle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationStatement {
     pub sql: String,
-    /// True for `DROP` statements that can lose data.
+    /// True for destructive or safety-lowering statements.
     pub destructive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedMigration {
+    pub operation: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MigrationScript {
     pub statements: Vec<MigrationStatement>,
+    pub unsupported: Vec<UnsupportedMigration>,
 }
 
 impl MigrationScript {
     pub fn is_empty(&self) -> bool {
-        self.statements.is_empty()
+        self.statements.is_empty() && self.unsupported.is_empty()
     }
 
     pub fn destructive_count(&self) -> usize {
         self.statements.iter().filter(|s| s.destructive).count()
+    }
+
+    pub fn has_unsupported(&self) -> bool {
+        !self.unsupported.is_empty()
     }
 
     /// The full script as one newline-joined SQL string.
@@ -363,6 +894,7 @@ impl SchemaDiff {
         style: AlterColumnStyle,
     ) -> MigrationScript {
         let mut statements = Vec::new();
+        let mut unsupported = Vec::new();
 
         for table in &self.added_tables {
             statements.push(MigrationStatement {
@@ -383,10 +915,13 @@ impl SchemaDiff {
             });
         }
         for table in &self.altered_tables {
-            emit_altered_table(dialect, style, table, &mut statements);
+            emit_altered_table(dialect, style, table, &mut statements, &mut unsupported);
         }
 
-        MigrationScript { statements }
+        MigrationScript {
+            statements,
+            unsupported,
+        }
     }
 }
 
@@ -404,6 +939,9 @@ fn create_table_sql(dialect: &dyn SqlDialect, table: &Table) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(format!("  PRIMARY KEY ({keys})"));
+    }
+    for constraint in &table.constraints {
+        lines.push(format!("  {}", constraint_definition(dialect, constraint)));
     }
     format!(
         "CREATE TABLE {} (\n{}\n);",
@@ -432,18 +970,39 @@ fn emit_altered_table(
     style: AlterColumnStyle,
     table: &AlteredTable,
     out: &mut Vec<MigrationStatement>,
+    unsupported: &mut Vec<UnsupportedMigration>,
 ) {
+    if let Some(reason) = unsupported_style_reason(dialect, style) {
+        unsupported.push(UnsupportedMigration {
+            operation: format!("alter table {}", table.name),
+            reason,
+        });
+        return;
+    }
+
     let quoted_table = dialect.quote_identifier(&table.name);
+    if let Some(from) = &table.renamed_from {
+        out.push(MigrationStatement {
+            sql: rename_table_sql(dialect, style, from, &table.name),
+            destructive: false,
+        });
+    }
 
     // Order so the script applies cleanly: add and alter columns, drop the
-    // indexes that may reference soon-to-be-dropped columns, drop columns, then
-    // (re)create indexes against the final column set.
+    // indexes/constraints that may reference soon-to-be-dropped columns, drop
+    // columns, then (re)create constraints and indexes against the final column set.
     for column in &table.added_columns {
         out.push(MigrationStatement {
             sql: format!(
                 "ALTER TABLE {quoted_table} ADD COLUMN {};",
                 column_definition(dialect, column)
             ),
+            destructive: false,
+        });
+    }
+    for rename in &table.renamed_columns {
+        out.push(MigrationStatement {
+            sql: rename_column_sql(dialect, style, &quoted_table, rename),
             destructive: false,
         });
     }
@@ -455,7 +1014,7 @@ fn emit_altered_table(
                         "ALTER TABLE {quoted_table} MODIFY COLUMN {};",
                         column_definition(dialect, &altered.column)
                     ),
-                    destructive: false,
+                    destructive: altered.changes.iter().any(ColumnChange::is_destructive),
                 });
             }
             AlterColumnStyle::Standard => {
@@ -482,11 +1041,43 @@ fn emit_altered_table(
                     };
                     out.push(MigrationStatement {
                         sql,
-                        destructive: false,
+                        destructive: change.is_destructive(),
                     });
                 }
             }
         }
+    }
+    if let Some(change) = &table.primary_key_change {
+        if !change.from.is_empty() {
+            out.push(MigrationStatement {
+                sql: drop_primary_key_sql(dialect, style, &table.name, &quoted_table),
+                destructive: true,
+            });
+        }
+        if !change.to.is_empty() {
+            out.push(MigrationStatement {
+                sql: add_primary_key_sql(dialect, &quoted_table, &change.to),
+                destructive: false,
+            });
+        }
+    }
+    for rename in &table.renamed_constraints {
+        match rename_constraint_sql(dialect, style, &quoted_table, rename) {
+            Some(sql) => out.push(MigrationStatement {
+                sql,
+                destructive: false,
+            }),
+            None => unsupported.push(UnsupportedMigration {
+                operation: format!("rename constraint {}.{}", table.name, rename.from),
+                reason: format!("{style:?} does not support portable constraint rename SQL"),
+            }),
+        }
+    }
+    for constraint in &table.dropped_constraints {
+        out.push(MigrationStatement {
+            sql: drop_constraint_sql(dialect, style, &quoted_table, constraint),
+            destructive: true,
+        });
     }
     for name in &table.dropped_indexes {
         let sql = match style {
@@ -504,6 +1095,12 @@ fn emit_altered_table(
             destructive: true,
         });
     }
+    for rename in &table.renamed_indexes {
+        out.push(MigrationStatement {
+            sql: rename_index_sql(dialect, style, &quoted_table, rename),
+            destructive: false,
+        });
+    }
     for name in &table.dropped_columns {
         out.push(MigrationStatement {
             sql: format!(
@@ -511,6 +1108,12 @@ fn emit_altered_table(
                 dialect.quote_identifier(name)
             ),
             destructive: true,
+        });
+    }
+    for constraint in &table.added_constraints {
+        out.push(MigrationStatement {
+            sql: add_constraint_sql(dialect, &quoted_table, constraint),
+            destructive: false,
         });
     }
     for index in &table.added_indexes {
@@ -534,6 +1137,198 @@ fn create_index_sql(dialect: &dyn SqlDialect, table: &str, index: &Index) -> Str
         dialect.quote_identifier(&index.name),
         dialect.quote_identifier(table)
     )
+}
+
+fn unsupported_style_reason(dialect: &dyn SqlDialect, style: AlterColumnStyle) -> Option<String> {
+    let placeholder = dialect.placeholder(1);
+    let probe = dialect.quote_identifier("irodori_probe");
+    match style {
+        AlterColumnStyle::Standard if placeholder == "$1" && probe == "\"irodori_probe\"" => None,
+        AlterColumnStyle::MySql if placeholder == "?" && probe == "`irodori_probe`" => None,
+        _ => Some(format!(
+            "{style:?} alter-table rendering is not supported for dialect hint placeholder={placeholder:?}, quoted_identifier={probe:?}"
+        )),
+    }
+}
+
+fn rename_table_sql(
+    dialect: &dyn SqlDialect,
+    style: AlterColumnStyle,
+    from: &str,
+    to: &str,
+) -> String {
+    match style {
+        AlterColumnStyle::MySql => format!(
+            "RENAME TABLE {} TO {};",
+            dialect.quote_identifier(from),
+            dialect.quote_identifier(to)
+        ),
+        AlterColumnStyle::Standard => format!(
+            "ALTER TABLE {} RENAME TO {};",
+            dialect.quote_identifier(from),
+            dialect.quote_identifier(to)
+        ),
+    }
+}
+
+fn rename_column_sql(
+    dialect: &dyn SqlDialect,
+    style: AlterColumnStyle,
+    quoted_table: &str,
+    rename: &Rename,
+) -> String {
+    match style {
+        AlterColumnStyle::MySql => format!(
+            "ALTER TABLE {quoted_table} RENAME COLUMN {} TO {};",
+            dialect.quote_identifier(&rename.from),
+            dialect.quote_identifier(&rename.to)
+        ),
+        AlterColumnStyle::Standard => format!(
+            "ALTER TABLE {quoted_table} RENAME COLUMN {} TO {};",
+            dialect.quote_identifier(&rename.from),
+            dialect.quote_identifier(&rename.to)
+        ),
+    }
+}
+
+fn rename_index_sql(
+    dialect: &dyn SqlDialect,
+    style: AlterColumnStyle,
+    quoted_table: &str,
+    rename: &Rename,
+) -> String {
+    match style {
+        AlterColumnStyle::MySql => format!(
+            "ALTER TABLE {quoted_table} RENAME INDEX {} TO {};",
+            dialect.quote_identifier(&rename.from),
+            dialect.quote_identifier(&rename.to)
+        ),
+        AlterColumnStyle::Standard => format!(
+            "ALTER INDEX {} RENAME TO {};",
+            dialect.quote_identifier(&rename.from),
+            dialect.quote_identifier(&rename.to)
+        ),
+    }
+}
+
+fn rename_constraint_sql(
+    dialect: &dyn SqlDialect,
+    style: AlterColumnStyle,
+    quoted_table: &str,
+    rename: &Rename,
+) -> Option<String> {
+    match style {
+        AlterColumnStyle::Standard => Some(format!(
+            "ALTER TABLE {quoted_table} RENAME CONSTRAINT {} TO {};",
+            dialect.quote_identifier(&rename.from),
+            dialect.quote_identifier(&rename.to)
+        )),
+        AlterColumnStyle::MySql => None,
+    }
+}
+
+fn drop_primary_key_sql(
+    dialect: &dyn SqlDialect,
+    style: AlterColumnStyle,
+    table: &str,
+    quoted_table: &str,
+) -> String {
+    match style {
+        AlterColumnStyle::MySql => format!("ALTER TABLE {quoted_table} DROP PRIMARY KEY;"),
+        AlterColumnStyle::Standard => format!(
+            "ALTER TABLE {quoted_table} DROP CONSTRAINT {};",
+            dialect.quote_identifier(&format!("{table}_pkey"))
+        ),
+    }
+}
+
+fn add_primary_key_sql(
+    dialect: &dyn SqlDialect,
+    quoted_table: &str,
+    columns: &[String],
+) -> String {
+    let columns = columns
+        .iter()
+        .map(|column| dialect.quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ALTER TABLE {quoted_table} ADD PRIMARY KEY ({columns});")
+}
+
+fn add_constraint_sql(
+    dialect: &dyn SqlDialect,
+    quoted_table: &str,
+    constraint: &TableConstraint,
+) -> String {
+    format!(
+        "ALTER TABLE {quoted_table} ADD {};",
+        constraint_definition(dialect, constraint)
+    )
+}
+
+fn drop_constraint_sql(
+    dialect: &dyn SqlDialect,
+    style: AlterColumnStyle,
+    quoted_table: &str,
+    constraint: &TableConstraint,
+) -> String {
+    match (style, constraint) {
+        (AlterColumnStyle::MySql, TableConstraint::ForeignKey(constraint)) => format!(
+            "ALTER TABLE {quoted_table} DROP FOREIGN KEY {};",
+            dialect.quote_identifier(&constraint.name)
+        ),
+        (AlterColumnStyle::MySql, TableConstraint::Check(constraint)) => format!(
+            "ALTER TABLE {quoted_table} DROP CHECK {};",
+            dialect.quote_identifier(&constraint.name)
+        ),
+        (AlterColumnStyle::MySql, TableConstraint::Unique(constraint)) => format!(
+            "ALTER TABLE {quoted_table} DROP INDEX {};",
+            dialect.quote_identifier(&constraint.name)
+        ),
+        (_, constraint) => format!(
+            "ALTER TABLE {quoted_table} DROP CONSTRAINT {};",
+            dialect.quote_identifier(constraint.name())
+        ),
+    }
+}
+
+fn constraint_definition(dialect: &dyn SqlDialect, constraint: &TableConstraint) -> String {
+    match constraint {
+        TableConstraint::ForeignKey(constraint) => {
+            let columns = quote_list(dialect, &constraint.columns);
+            let referenced_columns = quote_list(dialect, &constraint.referenced_columns);
+            let mut sql = format!(
+                "CONSTRAINT {} FOREIGN KEY ({columns}) REFERENCES {} ({referenced_columns})",
+                dialect.quote_identifier(&constraint.name),
+                dialect.quote_identifier(&constraint.referenced_table)
+            );
+            if let Some(action) = &constraint.on_delete {
+                sql.push_str(&format!(" ON DELETE {action}"));
+            }
+            if let Some(action) = &constraint.on_update {
+                sql.push_str(&format!(" ON UPDATE {action}"));
+            }
+            sql
+        }
+        TableConstraint::Check(constraint) => format!(
+            "CONSTRAINT {} CHECK ({})",
+            dialect.quote_identifier(&constraint.name),
+            constraint.expression
+        ),
+        TableConstraint::Unique(constraint) => format!(
+            "CONSTRAINT {} UNIQUE ({})",
+            dialect.quote_identifier(&constraint.name),
+            quote_list(dialect, &constraint.columns)
+        ),
+    }
+}
+
+fn quote_list(dialect: &dyn SqlDialect, names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| dialect.quote_identifier(name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

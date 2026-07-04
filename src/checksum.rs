@@ -116,8 +116,12 @@ pub struct SyncRepairPlan {
 
 pub fn chunk_checksum_select_sql(engine: MigrationEngine, config: &ChunkChecksumConfig) -> String {
     let row = canonical_row_sql(engine, &config.columns, &config.policy);
-    let row_hash = row_hash_as_integer(engine, config.function, &row);
-    let checksum = aggregate_sql(config.aggregate, &row_hash);
+    let checksum = match row_hash_as_integer(engine, config.function, &row)
+        .and_then(|row_hash| aggregate_sql(engine, config.aggregate, config.function, &row_hash))
+    {
+        Ok(checksum) => checksum,
+        Err(reason) => unsupported_checksum_sql(&reason),
+    };
     let mut lines = vec![
         "-- Chunk checksum. Compare row_count and chunk_checksum on both sides before row diff."
             .to_string(),
@@ -237,22 +241,34 @@ fn row_hash_as_integer(
     engine: MigrationEngine,
     function: ChecksumFunction,
     canonical_row: &str,
-) -> String {
+) -> Result<String, String> {
     match function {
-        ChecksumFunction::Crc32 => format!("CRC32({canonical_row})"),
-        ChecksumFunction::Fnv1a64 => format!("FNV1A_64({canonical_row})"),
-        ChecksumFunction::Fnv64 => format!("FNV_64({canonical_row})"),
-        ChecksumFunction::MurmurHash => format!("MURMUR_HASH({canonical_row})"),
+        ChecksumFunction::Crc32
+            if matches!(engine, MigrationEngine::MySql | MigrationEngine::MariaDb) =>
+        {
+            Ok(format!("CRC32({canonical_row})"))
+        }
+        ChecksumFunction::Crc32 => Err(format!(
+            "{} checksum SQL does not support CRC32 row hashes",
+            engine.label()
+        )),
+        ChecksumFunction::Fnv1a64 | ChecksumFunction::Fnv64 | ChecksumFunction::MurmurHash => {
+            Err(format!(
+                "{} checksum SQL does not support {} row hashes",
+                engine.label(),
+                function.sql_name()
+            ))
+        }
         ChecksumFunction::Md5 => md5_as_integer(engine, canonical_row),
         ChecksumFunction::Sha1 => sha1_as_integer(engine, canonical_row),
     }
 }
 
-fn md5_as_integer(engine: MigrationEngine, value: &str) -> String {
+fn md5_as_integer(engine: MigrationEngine, value: &str) -> Result<String, String> {
     hex_digest_as_integer(engine, &md5_hex_sql(engine, value), 17)
 }
 
-fn sha1_as_integer(engine: MigrationEngine, value: &str) -> String {
+fn sha1_as_integer(engine: MigrationEngine, value: &str) -> Result<String, String> {
     hex_digest_as_integer(engine, &sha1_hex_sql(engine, value), 25)
 }
 
@@ -273,32 +289,88 @@ fn sha1_hex_sql(engine: MigrationEngine, value: &str) -> String {
     }
 }
 
-fn hex_digest_as_integer(engine: MigrationEngine, digest_hex: &str, start: usize) -> String {
+fn hex_digest_as_integer(
+    engine: MigrationEngine,
+    digest_hex: &str,
+    start: usize,
+) -> Result<String, String> {
     match engine {
-        MigrationEngine::Postgres | MigrationEngine::Redshift => {
-            format!("(('x' || SUBSTRING({digest_hex}, {start}))::bit(64)::bigint)")
-        }
+        MigrationEngine::Postgres | MigrationEngine::Redshift => Ok(format!(
+            "(('x' || SUBSTRING({digest_hex}, {start}))::bit(64)::bigint)"
+        )),
         MigrationEngine::MySql | MigrationEngine::MariaDb => {
-            format!("CAST(CONV(SUBSTRING({digest_hex}, {start}), 16, 10) AS UNSIGNED)")
+            let unsigned =
+                format!("CAST(CONV(SUBSTRING({digest_hex}, {start}), 16, 10) AS DECIMAL(20,0))");
+            Ok(format!(
+                "(CASE WHEN {unsigned} >= 9223372036854775808 THEN {unsigned} - 18446744073709551616 ELSE {unsigned} END)"
+            ))
         }
-        MigrationEngine::Oracle => {
-            format!("TO_NUMBER(SUBSTR({digest_hex}, {start}), 'XXXXXXXXXXXXXXXX')")
+        MigrationEngine::Oracle => Ok(format!(
+            "TO_NUMBER(SUBSTR({digest_hex}, {start}), 'XXXXXXXXXXXXXXXX')"
+        )),
+        MigrationEngine::Snowflake => Ok(format!(
+            "TO_NUMBER(SUBSTR({digest_hex}, {start}), 'XXXXXXXXXXXXXXXX')"
+        )),
+        MigrationEngine::TrinoPresto => Ok(format!(
+            "CAST(FROM_BASE(SUBSTR({digest_hex}, {start}), 16) AS DECIMAL(38,0))"
+        )),
+        MigrationEngine::Hive | MigrationEngine::Databricks => Ok(format!(
+            "CAST(CONV(SUBSTR({digest_hex}, {start}), 16, 10) AS DECIMAL(38,0))"
+        )),
+        MigrationEngine::DuckDb | MigrationEngine::Iceberg | MigrationEngine::S3Tables => {
+            Err(format!(
+                "{} checksum SQL does not support portable hex digest to integer conversion",
+                engine.label()
+            ))
         }
-        MigrationEngine::Snowflake => {
-            format!("TO_NUMBER(SUBSTR({digest_hex}, {start}), 'XXXXXXXXXXXXXXXX')")
-        }
-        MigrationEngine::TrinoPresto => {
-            format!("CAST(FROM_BASE(SUBSTR({digest_hex}, {start}), 16) AS DECIMAL(38,0))")
-        }
-        _ => format!("CAST(CONV(SUBSTR({digest_hex}, {start}), 16, 10) AS DECIMAL(38,0))"),
     }
 }
 
-fn aggregate_sql(aggregate: ChecksumAggregate, row_hash: &str) -> String {
+fn aggregate_sql(
+    engine: MigrationEngine,
+    aggregate: ChecksumAggregate,
+    function: ChecksumFunction,
+    row_hash: &str,
+) -> Result<String, String> {
     match aggregate {
-        ChecksumAggregate::BitXor => format!("COALESCE(BIT_XOR(CAST({row_hash} AS UNSIGNED)), 0)"),
-        ChecksumAggregate::Sum => format!("COALESCE(SUM(CAST({row_hash} AS DECIMAL(38,0))), 0)"),
+        ChecksumAggregate::BitXor
+            if function == ChecksumFunction::Crc32
+                && matches!(engine, MigrationEngine::MySql | MigrationEngine::MariaDb) =>
+        {
+            Ok(format!(
+                "COALESCE(BIT_XOR(CAST({row_hash} AS UNSIGNED)), 0)"
+            ))
+        }
+        ChecksumAggregate::BitXor => Err(format!(
+            "{} checksum SQL does not support portable BIT_XOR aggregation for {}",
+            engine.label(),
+            function.sql_name()
+        )),
+        ChecksumAggregate::Sum => Ok(format!(
+            "COALESCE(SUM({}), 0)",
+            decimal_cast_sql(engine, row_hash)
+        )),
     }
+}
+
+fn decimal_cast_sql(engine: MigrationEngine, value: &str) -> String {
+    match engine {
+        MigrationEngine::Oracle | MigrationEngine::Snowflake => {
+            format!("CAST({value} AS NUMBER(38,0))")
+        }
+        MigrationEngine::Postgres | MigrationEngine::Redshift => {
+            format!("CAST({value} AS NUMERIC(38,0))")
+        }
+        _ => format!("CAST({value} AS DECIMAL(38,0))"),
+    }
+}
+
+fn unsupported_checksum_sql(reason: &str) -> String {
+    format!("IRODORI_UNSUPPORTED_CHECKSUM_SQL({})", sql_string(reason))
+}
+
+fn sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn chunk_predicate(engine: MigrationEngine, bounds: &ChunkBounds) -> String {
@@ -353,8 +425,10 @@ mod tests {
 
         assert!(sql.contains("COUNT(*) AS row_count"));
         assert!(sql.contains("SUM(CAST"));
+        assert!(sql.contains("NUMERIC(38,0)"));
         assert!(sql.contains("MD5"));
         assert!(sql.contains("id >= 100 AND id < 200"));
+        assert!(!sql.contains("UNSIGNED"));
     }
 
     #[test]
@@ -385,6 +459,39 @@ mod tests {
         assert!(sql.contains("SHA1"));
         assert!(sql.contains("SUBSTRING(SHA1"));
         assert!(!sql.contains("MD5(SHA1"));
+    }
+
+    #[test]
+    fn unsupported_checksum_combinations_fail_closed() {
+        let config = ChunkChecksumConfig::new(
+            "public.orders",
+            vec![CanonicalColumn::new("id", CanonicalType::Integer)],
+        )
+        .with_function(ChecksumFunction::Crc32)
+        .with_aggregate(ChecksumAggregate::BitXor);
+
+        let sql = chunk_checksum_select_sql(MigrationEngine::Postgres, &config);
+
+        assert!(sql.contains("IRODORI_UNSUPPORTED_CHECKSUM_SQL"));
+        assert!(!sql.contains("BIT_XOR(CAST"));
+        assert!(!sql.contains("UNSIGNED"));
+    }
+
+    #[test]
+    fn mysql_md5_sum_uses_signed_sixty_four_bit_semantics() {
+        let config = ChunkChecksumConfig::new(
+            "orders",
+            vec![CanonicalColumn::new("id", CanonicalType::Integer)],
+        )
+        .with_function(ChecksumFunction::Md5)
+        .with_aggregate(ChecksumAggregate::Sum);
+
+        let sql = chunk_checksum_select_sql(MigrationEngine::MySql, &config);
+
+        assert!(sql.contains("9223372036854775808"));
+        assert!(sql.contains("18446744073709551616"));
+        assert!(sql.contains("SUM(CAST"));
+        assert!(sql.contains("DECIMAL(38,0)"));
     }
 
     #[test]

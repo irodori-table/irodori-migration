@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::io::{self, Write};
 
 mod import;
@@ -159,6 +160,7 @@ pub trait TabularEncoder {
 pub struct DelimitedEncoder<W> {
     writer: W,
     options: DelimitedOptions,
+    columns_len: usize,
 }
 
 impl<W: Write> DelimitedEncoder<W> {
@@ -176,7 +178,11 @@ impl<W: Write> DelimitedEncoder<W> {
         options: DelimitedOptions,
     ) -> io::Result<Self> {
         validate_options(&options)?;
-        let mut encoder = Self { writer, options };
+        let mut encoder = Self {
+            writer,
+            options,
+            columns_len: columns.len(),
+        };
         if encoder.options.include_header {
             encoder.write_fields(columns.iter().map(AsRef::as_ref))?;
         }
@@ -188,6 +194,7 @@ impl<W: Write> DelimitedEncoder<W> {
     }
 
     pub fn write_row(&mut self, row: &[Cell<'_>]) -> io::Result<()> {
+        validate_row_width(row.len(), self.columns_len)?;
         for (index, cell) in row.iter().enumerate() {
             if index > 0 {
                 self.writer.write_all(&[self.options.delimiter])?;
@@ -199,8 +206,9 @@ impl<W: Write> DelimitedEncoder<W> {
                 }
                 Cell::Bool(value) => self.write_field(if *value { "true" } else { "false" })?,
                 Cell::Integer(value) => self.write_field(&value.to_string())?,
-                Cell::Float(value) => self.write_field(&value.to_string())?,
-                Cell::Text(value) | Cell::Object(value) => self.write_field(value)?,
+                Cell::Float(value) if value.is_finite() => self.write_field(&value.to_string())?,
+                Cell::Float(_) => return Err(non_finite_float_error()),
+                Cell::Text(value) | Cell::Object(value) => self.write_text_field(value)?,
             }
         }
         self.writer.write_all(self.options.line_ending.as_bytes())
@@ -215,13 +223,22 @@ impl<W: Write> DelimitedEncoder<W> {
             if index > 0 {
                 self.writer.write_all(&[self.options.delimiter])?;
             }
-            self.write_field(field)?;
+            self.write_text_field(field)?;
         }
         self.writer.write_all(self.options.line_ending.as_bytes())
     }
 
     fn write_field(&mut self, field: &str) -> io::Result<()> {
-        let needs_quote = needs_quote(field, &self.options);
+        self.write_field_value(field, false)
+    }
+
+    fn write_text_field(&mut self, field: &str) -> io::Result<()> {
+        self.write_field_value(field, true)
+    }
+
+    fn write_field_value(&mut self, field: &str, formula_guard: bool) -> io::Result<()> {
+        let field = guard_delimited_formula(field, formula_guard);
+        let needs_quote = needs_quote(field.as_ref(), &self.options);
         let quoted = match self.options.quote_style {
             QuoteStyle::Always => true,
             QuoteStyle::Necessary => needs_quote,
@@ -236,7 +253,7 @@ impl<W: Write> DelimitedEncoder<W> {
 
         if quoted {
             self.writer.write_all(&[self.options.quote])?;
-            for byte in field.as_bytes() {
+            for byte in field.as_ref().as_bytes() {
                 if *byte == self.options.quote {
                     self.writer
                         .write_all(&[self.options.quote, self.options.quote])?;
@@ -246,7 +263,7 @@ impl<W: Write> DelimitedEncoder<W> {
             }
             self.writer.write_all(&[self.options.quote])
         } else {
-            self.writer.write_all(field.as_bytes())
+            self.writer.write_all(field.as_ref().as_bytes())
         }
     }
 }
@@ -265,6 +282,7 @@ pub struct SqlInsertEncoder<W> {
     writer: W,
     table_name: String,
     columns: Vec<String>,
+    backslash_escapes: bool,
 }
 
 impl<W: Write> SqlInsertEncoder<W> {
@@ -279,28 +297,22 @@ impl<W: Write> SqlInsertEncoder<W> {
             .map(|c| dialect.quote_identifier(c.as_ref()))
             .collect();
         let quoted_table = dialect.quote_identifier(&table_name.into());
+        let backslash_escapes = dialect_uses_backslash_escapes(dialect);
         Self {
             writer,
             table_name: quoted_table,
             columns: cols,
+            backslash_escapes,
         }
     }
 
     pub fn write_row(&mut self, row: &[Cell<'_>]) -> io::Result<()> {
+        validate_row_width(row.len(), self.columns.len())?;
         let cols_str = self.columns.join(", ");
         let vals: Vec<String> = row
             .iter()
-            .map(|cell| match cell {
-                Cell::Null => "NULL".to_string(),
-                Cell::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-                Cell::Integer(i) => i.to_string(),
-                Cell::Float(f) => f.to_string(),
-                Cell::Text(t) | Cell::Object(t) => {
-                    let escaped = t.replace('\'', "''");
-                    format!("'{escaped}'")
-                }
-            })
-            .collect();
+            .map(|cell| sql_literal(cell, self.backslash_escapes))
+            .collect::<io::Result<Vec<_>>>()?;
         let vals_str = vals.join(", ");
         writeln!(
             self.writer,
@@ -416,6 +428,7 @@ pub struct SqlScriptEncoder<'a, W> {
     raw_columns: Vec<String>,
     dialect: &'a dyn crate::dialect::SqlDialect,
     options: SqlScriptOptions,
+    backslash_escapes: bool,
     batch: Vec<Vec<String>>,
 }
 
@@ -428,6 +441,7 @@ impl<'a, W: Write> SqlScriptEncoder<'a, W> {
         options: SqlScriptOptions,
     ) -> io::Result<Self> {
         let table_name = dialect.quote_identifier(&table_name.into());
+        let backslash_escapes = dialect_uses_backslash_escapes(dialect);
         let raw_columns = columns
             .iter()
             .map(|column| column.as_ref().to_string())
@@ -448,12 +462,18 @@ impl<'a, W: Write> SqlScriptEncoder<'a, W> {
             raw_columns,
             dialect,
             options,
+            backslash_escapes,
             batch: Vec::new(),
         })
     }
 
     pub fn write_row(&mut self, row: &[Cell<'_>]) -> io::Result<()> {
-        self.batch.push(row.iter().map(sql_literal).collect());
+        validate_row_width(row.len(), self.columns.len())?;
+        self.batch.push(
+            row.iter()
+                .map(|cell| sql_literal(cell, self.backslash_escapes))
+                .collect::<io::Result<Vec<_>>>()?,
+        );
         if self.batch.len() >= self.options.batch_size.max(1) {
             self.flush_batch()?;
         }
@@ -581,37 +601,12 @@ impl<W: Write> JsonEncoder<W> {
     }
 
     pub fn write_row(&mut self, row: &[Cell<'_>]) -> io::Result<()> {
+        validate_row_width(row.len(), self.columns.len())?;
+        let json_val = json_object_from_row(&self.columns, row)?;
         if !self.first {
             self.writer.write_all(b",\n")?;
         }
         self.first = false;
-
-        let mut map = serde_json::Map::new();
-        for (i, cell) in row.iter().enumerate() {
-            let col = self
-                .columns
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("col_{i}"));
-            let val = match cell {
-                Cell::Null => serde_json::Value::Null,
-                Cell::Bool(b) => serde_json::Value::Bool(*b),
-                Cell::Integer(i) => serde_json::Value::Number(serde_json::Number::from(*i)),
-                Cell::Float(f) => serde_json::Value::Number(
-                    serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from(0)),
-                ),
-                Cell::Text(t) => serde_json::Value::String(t.to_string()),
-                Cell::Object(o) => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(o) {
-                        v
-                    } else {
-                        serde_json::Value::String(o.to_string())
-                    }
-                }
-            };
-            map.insert(col, val);
-        }
-        let json_val = serde_json::Value::Object(map);
         serde_json::to_writer(&mut self.writer, &json_val)?;
         Ok(())
     }
@@ -645,32 +640,8 @@ impl<W: Write> NdjsonEncoder<W> {
     }
 
     pub fn write_row(&mut self, row: &[Cell<'_>]) -> io::Result<()> {
-        let mut map = serde_json::Map::new();
-        for (i, cell) in row.iter().enumerate() {
-            let col = self
-                .columns
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("col_{i}"));
-            let val = match cell {
-                Cell::Null => serde_json::Value::Null,
-                Cell::Bool(b) => serde_json::Value::Bool(*b),
-                Cell::Integer(i) => serde_json::Value::Number(serde_json::Number::from(*i)),
-                Cell::Float(f) => serde_json::Value::Number(
-                    serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from(0)),
-                ),
-                Cell::Text(t) => serde_json::Value::String(t.to_string()),
-                Cell::Object(o) => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(o) {
-                        v
-                    } else {
-                        serde_json::Value::String(o.to_string())
-                    }
-                }
-            };
-            map.insert(col, val);
-        }
-        let json_val = serde_json::Value::Object(map);
+        validate_row_width(row.len(), self.columns.len())?;
+        let json_val = json_object_from_row(&self.columns, row)?;
         serde_json::to_writer(&mut self.writer, &json_val)?;
         self.writer.write_all(b"\n")?;
         Ok(())
@@ -728,6 +699,8 @@ impl<W: Write> AvroEncoder<W> {
     }
 
     pub fn write_row(&mut self, row: &[Cell<'_>]) -> io::Result<()> {
+        validate_row_width(row.len(), self.columns.len())?;
+        validate_finite_cells(row)?;
         self.buffered_rows
             .push(row.iter().map(|cell| cell.to_owned()).collect());
         Ok(())
@@ -806,6 +779,8 @@ pub struct ParquetEncoder<W: Write + Send> {
 
 #[cfg(feature = "parquet")]
 impl<W: Write + Send> ParquetEncoder<W> {
+    const MAX_BUFFERED_ROWS: usize = 100_000;
+
     pub fn new(writer: W, columns: &[impl AsRef<str>]) -> Self {
         Self {
             writer: Some(writer),
@@ -815,6 +790,14 @@ impl<W: Write + Send> ParquetEncoder<W> {
     }
 
     pub fn write_row(&mut self, row: &[Cell<'_>]) -> io::Result<()> {
+        validate_row_width(row.len(), self.columns.len())?;
+        validate_finite_cells(row)?;
+        if self.buffered_rows.len() >= Self::MAX_BUFFERED_ROWS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "parquet encoder buffers rows and reached the bounded row limit",
+            ));
+        }
         self.buffered_rows
             .push(row.iter().map(|c| c.to_owned()).collect());
         Ok(())
@@ -982,21 +965,90 @@ fn write_create_table(
     writeln!(writer, ");")
 }
 
-fn sql_literal(cell: &Cell<'_>) -> String {
+fn sql_literal(cell: &Cell<'_>, backslash_escapes: bool) -> io::Result<String> {
     match cell {
-        Cell::Null => "NULL".to_string(),
-        Cell::Bool(value) => {
+        Cell::Null => Ok("NULL".to_string()),
+        Cell::Bool(value) => Ok({
             if *value {
                 "TRUE".to_string()
             } else {
                 "FALSE".to_string()
             }
-        }
-        Cell::Integer(value) => value.to_string(),
-        Cell::Float(value) if value.is_finite() => value.to_string(),
-        Cell::Float(_) => "NULL".to_string(),
-        Cell::Text(value) | Cell::Object(value) => format!("'{}'", value.replace('\'', "''")),
+        }),
+        Cell::Integer(value) => Ok(value.to_string()),
+        Cell::Float(value) if value.is_finite() => Ok(value.to_string()),
+        Cell::Float(_) => Err(non_finite_float_error()),
+        Cell::Text(value) | Cell::Object(value) => Ok(sql_string_literal(value, backslash_escapes)),
     }
+}
+
+fn json_object_from_row(columns: &[String], row: &[Cell<'_>]) -> io::Result<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for (col, cell) in columns.iter().zip(row.iter()) {
+        map.insert(col.clone(), json_cell(cell)?);
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+fn json_cell(cell: &Cell<'_>) -> io::Result<serde_json::Value> {
+    match cell {
+        Cell::Null => Ok(serde_json::Value::Null),
+        Cell::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        Cell::Integer(i) => Ok(serde_json::Value::Number(serde_json::Number::from(*i))),
+        Cell::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .ok_or_else(non_finite_float_error),
+        Cell::Text(t) => Ok(serde_json::Value::String(t.to_string())),
+        Cell::Object(o) => Ok(serde_json::from_str::<serde_json::Value>(o)
+            .unwrap_or_else(|_| serde_json::Value::String(o.to_string()))),
+    }
+}
+
+fn validate_row_width(actual: usize, expected: usize) -> io::Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("row has {actual} cells but encoder has {expected} columns"),
+        ))
+    }
+}
+
+fn validate_finite_cells(row: &[Cell<'_>]) -> io::Result<()> {
+    if row
+        .iter()
+        .any(|cell| matches!(cell, Cell::Float(value) if !value.is_finite()))
+    {
+        Err(non_finite_float_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn non_finite_float_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "non-finite floating-point values cannot be encoded",
+    )
+}
+
+pub(super) fn sql_string_literal(value: &str, backslash_escapes: bool) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\'' => escaped.push_str("''"),
+            '\\' if backslash_escapes => escaped.push_str("\\\\"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+pub(super) fn dialect_uses_backslash_escapes(dialect: &dyn crate::dialect::SqlDialect) -> bool {
+    dialect.quote_identifier("__irodori_probe__").starts_with('`')
 }
 
 fn validate_options(options: &DelimitedOptions) -> io::Result<()> {
@@ -1025,6 +1077,20 @@ fn needs_quote(field: &str, options: &DelimitedOptions) -> bool {
     field.bytes().any(|byte| {
         byte == options.delimiter || byte == options.quote || matches!(byte, b'\n' | b'\r')
     })
+}
+
+fn guard_delimited_formula(field: &str, enabled: bool) -> Cow<'_, str> {
+    if enabled && starts_like_spreadsheet_formula(field) {
+        Cow::Owned(format!("'{field}"))
+    } else {
+        Cow::Borrowed(field)
+    }
+}
+
+fn starts_like_spreadsheet_formula(field: &str) -> bool {
+    matches!(field.as_bytes().first(), Some(b'=') | Some(b'+') | Some(b'-') | Some(b'@'))
+        || field.starts_with('\t')
+        || field.starts_with('\r')
 }
 
 #[cfg(test)]

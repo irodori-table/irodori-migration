@@ -211,6 +211,30 @@ pub fn canonicalization_warnings(
     }) {
         warnings.push("Naive timestamps must be compared only after source and target session time zones are pinned.".to_string());
     }
+    if columns.iter().any(|column| {
+        matches!(
+            column.value_type,
+            CanonicalType::Timestamp {
+                mode: TimestampMode::Utc,
+                ..
+            }
+        )
+    }) && matches!(
+        engine,
+        MigrationEngine::MySql
+            | MigrationEngine::MariaDb
+            | MigrationEngine::Hive
+            | MigrationEngine::DuckDb
+            | MigrationEngine::Iceberg
+            | MigrationEngine::S3Tables
+            | MigrationEngine::Databricks
+            | MigrationEngine::TrinoPresto
+    ) {
+        warnings.push(format!(
+            "{} UTC timestamp canonicalization is not emitted because the portable SQL builder cannot prove a non-lossy timezone conversion.",
+            engine.label()
+        ));
+    }
     if columns
         .iter()
         .any(|column| matches!(column.value_type, CanonicalType::Bytes))
@@ -255,16 +279,17 @@ fn decimal_sql(engine: MigrationEngine, value: &str, scale: u8) -> String {
 }
 
 fn float_sql(engine: MigrationEngine, value: &str, precision: u8) -> String {
-    text_sql(engine, &format!("ROUND({value}, {precision})"))
+    match engine {
+        MigrationEngine::Postgres | MigrationEngine::Redshift => text_sql(
+            engine,
+            &format!("ROUND(CAST({value} AS NUMERIC), {precision})"),
+        ),
+        _ => text_sql(engine, &format!("ROUND({value}, {precision})")),
+    }
 }
 
 fn boolean_sql(engine: MigrationEngine, value: &str) -> String {
-    let expression = match engine {
-        MigrationEngine::MySql | MigrationEngine::MariaDb => {
-            format!("CASE WHEN {value} THEN 1 ELSE 0 END")
-        }
-        _ => format!("CASE WHEN {value} THEN 1 ELSE 0 END"),
-    };
+    let expression = format!("CASE WHEN {value} IS NULL THEN NULL WHEN {value} THEN 1 ELSE 0 END");
     text_sql(engine, &expression)
 }
 
@@ -349,11 +374,18 @@ fn timestamp_utc_sql(engine: MigrationEngine, value: &str) -> String {
             format!("({value} AT TIME ZONE 'UTC')")
         }
         MigrationEngine::Snowflake => format!("CONVERT_TIMEZONE('UTC', {value})"),
-        MigrationEngine::MySql | MigrationEngine::MariaDb => {
-            format!("CONVERT_TZ({value}, @@session.time_zone, '+00:00')")
-        }
         MigrationEngine::Oracle => format!("SYS_EXTRACT_UTC({value})"),
-        _ => value.to_string(),
+        MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Databricks
+        | MigrationEngine::TrinoPresto => unsupported_sql(&format!(
+            "{} UTC timestamp canonicalization requires an explicit, non-silent timezone conversion outside the portable SQL builder",
+            engine.label()
+        )),
     }
 }
 
@@ -428,6 +460,10 @@ fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn unsupported_sql(reason: &str) -> String {
+    format!("IRODORI_UNSUPPORTED_SQL({})", sql_string(reason))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +480,57 @@ mod tests {
         );
         assert!(
             canonical_cell_sql(MigrationEngine::MySql, &float, &policy).contains("ROUND(score, 4)")
+        );
+        assert!(
+            canonical_cell_sql(MigrationEngine::Postgres, &float, &policy)
+                .contains("ROUND(CAST(score AS NUMERIC), 4)")
+        );
+    }
+
+    #[test]
+    fn boolean_canonicalization_preserves_nulls() {
+        let policy = CanonicalizationPolicy::default();
+        let column = CanonicalColumn::new("is_active", CanonicalType::Boolean);
+        let sql = canonical_cell_sql(MigrationEngine::Postgres, &column, &policy);
+
+        assert!(sql.contains("is_active IS NULL THEN NULL"));
+        assert!(sql.contains("WHEN is_active THEN 1 ELSE 0"));
+    }
+
+    #[test]
+    fn mysql_utc_timestamp_fails_closed_instead_of_convert_tz() {
+        let policy = CanonicalizationPolicy::default();
+        let column = CanonicalColumn::new(
+            "updated_at",
+            CanonicalType::Timestamp {
+                fractional_digits: 3,
+                mode: TimestampMode::Utc,
+            },
+        );
+        let sql = canonical_cell_sql(MigrationEngine::MySql, &column, &policy);
+
+        assert!(sql.contains("IRODORI_UNSUPPORTED_SQL"));
+        assert!(!sql.contains("CONVERT_TZ"));
+    }
+
+    #[test]
+    fn duckdb_and_trino_utc_timestamps_fail_closed() {
+        let policy = CanonicalizationPolicy::default();
+        let column = CanonicalColumn::new(
+            "updated_at",
+            CanonicalType::Timestamp {
+                fractional_digits: 6,
+                mode: TimestampMode::Utc,
+            },
+        );
+
+        assert!(
+            canonical_cell_sql(MigrationEngine::DuckDb, &column, &policy)
+                .contains("IRODORI_UNSUPPORTED_SQL")
+        );
+        assert!(
+            canonical_cell_sql(MigrationEngine::TrinoPresto, &column, &policy)
+                .contains("IRODORI_UNSUPPORTED_SQL")
         );
     }
 
