@@ -20,7 +20,7 @@ until the behavior is fixed and covered by tests.
 | #10 | Open | encoders | JSON/NDJSON non-finite floats are silently converted to `0`; SQL scripts convert them to `NULL`. |
 | #11 | Open | import inference | CSV/JSON numeric inference can lose leading zeroes or precision for integers beyond `i64`. |
 | #12 | Fixed | Avro | `AvroEncoder` leaked schemas with `Box::leak` and used `Record::new(...).unwrap()`. It now owns the schema, writes through a short-lived Avro writer in `finish`, and returns `io::Error` for invalid schema/field names. |
-| #13 | Open | Parquet/preview | Parquet export and some preview paths still buffer all rows in memory. |
+| #13 | Open | Avro/Parquet/preview | Avro now avoids leaking schema memory but buffers rows until `finish`; Parquet export and some preview paths also buffer all rows in memory. |
 
 ## Design And API
 
@@ -51,4 +51,3 @@ until the behavior is fixed and covered by tests.
 | #26 | Open | tests | Container coverage still focuses on generated SQL shape and should broaden to checksum/canonical equivalence, schema DDL smoke tests, and IO edge cases. |
 | #27 | Open | desktop integration | `irodori-table` does not depend on this crate yet; the desktop migration studio has an incompatible TS planner. Prefer making this crate the Tauri command source of truth after row-hash negotiation is stable. |
 | #28 | Open | miscellany | Remaining small review notes should be split into focused issues as adjacent code is touched. |
-

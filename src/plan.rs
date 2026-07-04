@@ -4,7 +4,7 @@
 //! snippets for upstream applications that own connections, credentials, job
 //! scheduling, and object storage access.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::canonical::{canonical_row_from_values_sql, CanonicalizationPolicy};
 use crate::sql_ref::{column_ref, identifier_ref, table_ref};
@@ -89,6 +89,108 @@ pub struct ForeignKeySpec {
     pub parent_table: String,
     pub child_columns: Vec<String>,
     pub parent_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkIterationConfig {
+    pub table: String,
+    pub key_columns: Vec<String>,
+    pub predicate: String,
+    pub batch_size: u64,
+}
+
+impl ChunkIterationConfig {
+    pub fn new(table: impl Into<String>, key_columns: Vec<String>) -> Self {
+        Self {
+            table: table.into(),
+            key_columns,
+            predicate: String::new(),
+            batch_size: 1_000,
+        }
+    }
+
+    pub fn with_predicate(mut self, predicate: impl Into<String>) -> Self {
+        self.predicate = predicate.into();
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: u64) -> Self {
+        self.batch_size = batch_size.clamp(1_000, 100_000_000);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationCheckpointConfig {
+    pub migration_id: String,
+    pub table_name: String,
+    pub checkpoint_table: String,
+    pub chunk_table: String,
+}
+
+impl MigrationCheckpointConfig {
+    pub fn new(migration_id: impl Into<String>, table_name: impl Into<String>) -> Self {
+        Self {
+            migration_id: migration_id.into(),
+            table_name: table_name.into(),
+            checkpoint_table: "irodori_migration_checkpoints".to_string(),
+            chunk_table: "irodori_migration_chunks".to_string(),
+        }
+    }
+
+    pub fn with_checkpoint_table(mut self, table: impl Into<String>) -> Self {
+        self.checkpoint_table = table.into();
+        self
+    }
+
+    pub fn with_chunk_table(mut self, table: impl Into<String>) -> Self {
+        self.chunk_table = table.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyLoadOrder {
+    pub ordered_tables: Vec<String>,
+    pub deferred_foreign_keys: Vec<ForeignKeySpec>,
+    pub missing_tables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceColumnSpec {
+    pub name: String,
+    pub source_type: String,
+    pub nullable: bool,
+    pub default: Option<String>,
+}
+
+impl SourceColumnSpec {
+    pub fn new(name: impl Into<String>, source_type: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            source_type: source_type.into(),
+            nullable: true,
+            default: None,
+        }
+    }
+
+    pub fn not_null(mut self) -> Self {
+        self.nullable = false;
+        self
+    }
+
+    pub fn with_default(mut self, default: impl Into<String>) -> Self {
+        self.default = Some(default.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnTypeMapping {
+    pub source_type: String,
+    pub target_type: String,
+    pub lossy: bool,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +369,7 @@ pub fn build_migration_plan(spec: &MigrationSpec) -> MigrationPlan {
         &spec,
     );
     let source_sql = join_blocks([
+        source_chunk_iteration_block(&spec, &keys),
         source_extraction_sql(&spec, &keys, &hash_columns, &source_hash_sql),
         statement(&fingerprint_sql(
             spec.source_engine,
@@ -282,6 +385,7 @@ pub fn build_migration_plan(spec: &MigrationSpec) -> MigrationPlan {
             &keys,
             &spec.partition_column,
         )),
+        checkpoint_sql_block(&spec),
         statement(&fingerprint_sql(
             spec.target_engine,
             &target_hash_sql,
@@ -466,6 +570,412 @@ pub fn vscode_snippet_body(sql: &str, variables: &[MigrationSnippetVariable]) ->
         body = body.replace(&token, &placeholder);
     }
     body
+}
+
+pub fn chunk_iteration_sql(engine: MigrationEngine, config: &ChunkIterationConfig) -> String {
+    let keys = unique_case_insensitive(
+        config
+            .key_columns
+            .iter()
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    );
+    if keys.is_empty() {
+        return [
+            "-- Chunk iterator needs at least one stable key column.",
+            "-- Use a primary key, unique key, or monotonic partition column before generating chunks.",
+        ]
+        .join("\n");
+    }
+
+    let batch_size = config.batch_size.clamp(1_000, 100_000_000);
+    let key_projection = keys
+        .iter()
+        .map(|key| format!("    {} AS {}", column_ref(engine, key), identifier_ref(engine, key)))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let source_order = keys
+        .iter()
+        .map(|key| column_ref(engine, key))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key_refs = keys
+        .iter()
+        .map(|key| identifier_ref(engine, key))
+        .collect::<Vec<_>>();
+    let first_key = &key_refs[0];
+    let chunk_order = key_refs.join(", ");
+    let where_clause = if config.predicate.trim().is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", config.predicate.trim())
+    };
+
+    [
+        format!("-- Chunk iterator. Feed each chunk_id/lower/upper into checksum and load workers; batch_size={batch_size}."),
+        "WITH ordered_keys AS (".to_string(),
+        "  SELECT".to_string(),
+        key_projection,
+        format!("  FROM {}", table_ref(engine, &config.table)),
+        where_clause,
+        format!("  GROUP BY {source_order}"),
+        "),".to_string(),
+        "numbered_keys AS (".to_string(),
+        "  SELECT".to_string(),
+        format!("    {chunk_order},"),
+        format!("    ROW_NUMBER() OVER (ORDER BY {chunk_order}) AS irodori_row_number"),
+        "  FROM ordered_keys".to_string(),
+        "),".to_string(),
+        "chunked_keys AS (".to_string(),
+        "  SELECT".to_string(),
+        format!("    {chunk_order},"),
+        format!("    FLOOR((irodori_row_number - 1) / {batch_size}) AS irodori_chunk_ordinal"),
+        "  FROM numbered_keys".to_string(),
+        ")".to_string(),
+        "SELECT".to_string(),
+        "  irodori_chunk_ordinal AS chunk_id,".to_string(),
+        format!("  MIN({first_key}) AS lower_boundary,"),
+        format!("  MAX({first_key}) AS upper_boundary,"),
+        "  COUNT(*) AS key_count".to_string(),
+        "FROM chunked_keys".to_string(),
+        "GROUP BY irodori_chunk_ordinal".to_string(),
+        "ORDER BY irodori_chunk_ordinal".to_string(),
+    ]
+    .into_iter()
+    .filter(|line| !line.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+pub fn chunk_manifest_table_sql(engine: MigrationEngine, table: &str) -> String {
+    let text = string_type(engine);
+    let count = integer_type(engine);
+    [
+        "-- Stores generated chunk boundaries so validation can resume without re-walking the source table.",
+        &format!("CREATE TABLE IF NOT EXISTS {} (", table_ref(engine, table)),
+        &format!("  migration_id {text} NOT NULL,"),
+        &format!("  table_name {text} NOT NULL,"),
+        &format!("  chunk_id {text} NOT NULL,"),
+        &format!("  lower_boundary {text},"),
+        &format!("  upper_boundary {text},"),
+        &format!("  key_count {count},"),
+        "  created_at TIMESTAMP",
+        ");",
+    ]
+    .join("\n")
+}
+
+pub fn checkpoint_table_sql(engine: MigrationEngine, table: &str) -> String {
+    let text = string_type(engine);
+    let count = integer_type(engine);
+    [
+        "-- Checkpoint table for resumable chunk validation and backfill workers.",
+        &format!("CREATE TABLE IF NOT EXISTS {} (", table_ref(engine, table)),
+        &format!("  migration_id {text} NOT NULL,"),
+        &format!("  table_name {text} NOT NULL,"),
+        &format!("  chunk_id {text} NOT NULL,"),
+        &format!("  status {text} NOT NULL,"),
+        &format!("  row_count {count},"),
+        &format!("  checksum {text},"),
+        &format!("  error_message {text},"),
+        "  updated_at TIMESTAMP",
+        ");",
+    ]
+    .join("\n")
+}
+
+pub fn checkpoint_resume_sql(engine: MigrationEngine, config: &MigrationCheckpointConfig) -> String {
+    [
+        "-- Resume cursor: pick the first chunk that has not reached a completed checkpoint.",
+        "SELECT".to_string(),
+        "  c.chunk_id,".to_string(),
+        "  c.lower_boundary,".to_string(),
+        "  c.upper_boundary".to_string(),
+        format!("FROM {} c", table_ref(engine, &config.chunk_table)),
+        format!(
+            "LEFT JOIN {} p",
+            table_ref(engine, &config.checkpoint_table)
+        ),
+        format!(
+            "  ON p.migration_id = {}\n  AND p.table_name = {}\n  AND p.chunk_id = c.chunk_id\n  AND p.status = 'completed'",
+            sql_string(&config.migration_id),
+            sql_string(&config.table_name)
+        ),
+        format!(
+            "WHERE c.migration_id = {}\n  AND c.table_name = {}\n  AND p.chunk_id IS NULL",
+            sql_string(&config.migration_id),
+            sql_string(&config.table_name)
+        ),
+        "ORDER BY c.chunk_id".to_string(),
+        single_row_limit_clause(engine),
+    ]
+    .join("\n")
+}
+
+pub fn checkpoint_mark_completed_sql(
+    engine: MigrationEngine,
+    config: &MigrationCheckpointConfig,
+) -> String {
+    [
+        "-- Mark a chunk completed after source/target counts and checksum/hash gates pass.",
+        format!(
+            "DELETE FROM {}\nWHERE migration_id = {}\n  AND table_name = {}\n  AND chunk_id = '${{IRODORI_CHUNK_ID}}';",
+            table_ref(engine, &config.checkpoint_table),
+            sql_string(&config.migration_id),
+            sql_string(&config.table_name)
+        ),
+        format!(
+            "INSERT INTO {} (migration_id, table_name, chunk_id, status, row_count, checksum, updated_at)\nVALUES ({}, {}, '${{IRODORI_CHUNK_ID}}', 'completed', ${{IRODORI_ROW_COUNT}}, '${{IRODORI_CHECKSUM}}', CURRENT_TIMESTAMP);",
+            table_ref(engine, &config.checkpoint_table),
+            sql_string(&config.migration_id),
+            sql_string(&config.table_name)
+        ),
+    ]
+    .join("\n")
+}
+
+pub fn foreign_key_load_order(
+    tables: &[String],
+    foreign_keys: &[ForeignKeySpec],
+) -> ForeignKeyLoadOrder {
+    let known = tables.iter().cloned().collect::<HashSet<_>>();
+    let mut in_degree = tables
+        .iter()
+        .map(|table| (table.clone(), 0usize))
+        .collect::<HashMap<_, _>>();
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    let mut edges = HashSet::new();
+    let mut deferred_foreign_keys = Vec::new();
+    let mut missing_tables = Vec::new();
+
+    for foreign_key in foreign_keys {
+        let child_known = known.contains(&foreign_key.child_table);
+        let parent_known = known.contains(&foreign_key.parent_table);
+        if !child_known || !parent_known {
+            if !child_known {
+                missing_tables.push(foreign_key.child_table.clone());
+            }
+            if !parent_known {
+                missing_tables.push(foreign_key.parent_table.clone());
+            }
+            deferred_foreign_keys.push(foreign_key.clone());
+            continue;
+        }
+        if foreign_key.child_table == foreign_key.parent_table {
+            deferred_foreign_keys.push(foreign_key.clone());
+            continue;
+        }
+        if edges.insert((
+            foreign_key.parent_table.clone(),
+            foreign_key.child_table.clone(),
+        )) {
+            children
+                .entry(foreign_key.parent_table.clone())
+                .or_default()
+                .push(foreign_key.child_table.clone());
+            *in_degree
+                .entry(foreign_key.child_table.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
+    let mut ready = tables
+        .iter()
+        .filter(|table| in_degree.get(*table).copied().unwrap_or(0) == 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut ordered_tables = Vec::new();
+    while let Some(table) = ready.first().cloned() {
+        ready.remove(0);
+        if ordered_tables.contains(&table) {
+            continue;
+        }
+        ordered_tables.push(table.clone());
+        if let Some(next_children) = children.get(&table) {
+            for child in next_children {
+                if let Some(degree) = in_degree.get_mut(child) {
+                    *degree = degree.saturating_sub(1);
+                    if *degree == 0 && !ordered_tables.contains(child) && !ready.contains(child) {
+                        ready.push(child.clone());
+                    }
+                }
+            }
+        }
+        ready.sort_by_key(|candidate| {
+            tables
+                .iter()
+                .position(|table| table == candidate)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    let remaining = tables
+        .iter()
+        .filter(|table| !ordered_tables.contains(*table))
+        .cloned()
+        .collect::<HashSet<_>>();
+    if !remaining.is_empty() {
+        for foreign_key in foreign_keys {
+            if remaining.contains(&foreign_key.child_table)
+                && remaining.contains(&foreign_key.parent_table)
+                && !deferred_foreign_keys.contains(foreign_key)
+            {
+                deferred_foreign_keys.push(foreign_key.clone());
+            }
+        }
+        ordered_tables.extend(
+            tables
+                .iter()
+                .filter(|table| remaining.contains(*table))
+                .cloned(),
+        );
+    }
+
+    ForeignKeyLoadOrder {
+        ordered_tables,
+        deferred_foreign_keys,
+        missing_tables: unique_case_insensitive(missing_tables),
+    }
+}
+
+pub fn map_column_type(
+    source_engine: MigrationEngine,
+    target_engine: MigrationEngine,
+    source_type: &str,
+) -> ColumnTypeMapping {
+    let trimmed = source_type.trim();
+    let normalized = normalize_type_name(trimmed);
+    let mut warnings = Vec::new();
+    let mut lossy = false;
+    let target_type = if normalized.contains("json")
+        || normalized.contains("variant")
+        || normalized.contains("object")
+    {
+        json_ddl_type(target_engine)
+    } else if normalized.contains("uuid") {
+        uuid_ddl_type(target_engine)
+    } else if normalized.contains("bool") {
+        boolean_ddl_type(target_engine)
+    } else if normalized.contains("timestamp")
+        || normalized.contains("datetime")
+        || normalized.starts_with("time ")
+        || normalized == "time"
+    {
+        if matches!(source_engine, MigrationEngine::Oracle | MigrationEngine::MySql) {
+            warnings.push(
+                "Timestamp timezone/session semantics need explicit validation before cutover."
+                    .to_string(),
+            );
+        }
+        timestamp_ddl_type(target_engine)
+    } else if normalized == "date" {
+        "DATE".to_string()
+    } else if normalized.contains("blob")
+        || normalized.contains("binary")
+        || normalized.contains("bytea")
+        || normalized.contains("bytes")
+        || normalized.contains("raw")
+    {
+        bytes_ddl_type(target_engine)
+    } else if normalized.contains("decimal")
+        || normalized.contains("numeric")
+        || normalized.contains("number")
+    {
+        if normalized == "number" && source_engine == MigrationEngine::Oracle {
+            lossy = true;
+            warnings.push(
+                "Oracle NUMBER without precision/scale maps to a wide decimal and needs inventory evidence."
+                    .to_string(),
+            );
+        }
+        decimal_ddl_type(target_engine, trimmed)
+    } else if normalized.contains("bigint") || normalized.contains("long") {
+        integer_ddl_type(target_engine, true)
+    } else if normalized.contains("int") {
+        if normalized.contains("unsigned") {
+            lossy = true;
+            warnings.push("Unsigned integer range needs explicit target bounds validation.".to_string());
+        }
+        integer_ddl_type(target_engine, false)
+    } else if normalized.contains("double")
+        || normalized.contains("float")
+        || normalized.contains("real")
+    {
+        lossy = true;
+        float_ddl_type(target_engine, normalized.contains("double"))
+    } else if normalized.contains("char")
+        || normalized.contains("string")
+        || normalized.contains("text")
+        || normalized.contains("clob")
+    {
+        string_ddl_type_for_source(target_engine, trimmed)
+    } else {
+        lossy = true;
+        warnings.push(format!(
+            "No direct mapping for `{trimmed}`; mapped to a text type for review."
+        ));
+        string_ddl_type_for_source(target_engine, "text")
+    };
+
+    ColumnTypeMapping {
+        source_type: trimmed.to_string(),
+        target_type,
+        lossy,
+        warnings,
+    }
+}
+
+pub fn target_table_ddl_sql(
+    source_engine: MigrationEngine,
+    target_engine: MigrationEngine,
+    target_table: &str,
+    columns: &[SourceColumnSpec],
+) -> String {
+    if columns.is_empty() {
+        return "-- Target DDL needs source inventory columns before it can be generated.".to_string();
+    }
+
+    let mut warnings = Vec::new();
+    let definitions = columns
+        .iter()
+        .map(|column| {
+            let mapping = map_column_type(source_engine, target_engine, &column.source_type);
+            warnings.extend(
+                mapping
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("-- {}: {warning}", column.name)),
+            );
+            let nullable = if column.nullable { "" } else { " NOT NULL" };
+            let default = column
+                .default
+                .as_ref()
+                .map(|value| format!(" DEFAULT {value}"))
+                .unwrap_or_default();
+            format!(
+                "  {} {}{}{}",
+                identifier_ref(target_engine, &column.name),
+                mapping.target_type,
+                nullable,
+                default
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut lines = vec![
+        format!(
+            "-- Target DDL generated from {} inventory for {}.",
+            source_engine.label(),
+            target_engine.label()
+        ),
+    ];
+    lines.extend(warnings);
+    lines.push(format!("CREATE TABLE {} (", table_ref(target_engine, target_table)));
+    lines.push(definitions.join(",\n"));
+    lines.push(");".to_string());
+    lines.join("\n")
 }
 
 pub fn row_hash_select_sql(
@@ -1520,6 +2030,41 @@ fn snowflake_load_sql(spec: &MigrationSpec) -> String {
     .join("\n")
 }
 
+fn source_chunk_iteration_block(spec: &MigrationSpec, keys: &[String]) -> String {
+    let mut chunk_keys = keys.to_vec();
+    if chunk_keys.is_empty() && !spec.partition_column.trim().is_empty() {
+        chunk_keys.push(spec.partition_column.clone());
+    }
+    if chunk_keys.is_empty() {
+        return String::new();
+    }
+    statement(&chunk_iteration_sql(
+        spec.source_engine,
+        &ChunkIterationConfig::new(&spec.source_table, chunk_keys)
+            .with_predicate(&spec.partition_predicate)
+            .with_batch_size(spec.batch_size),
+    ))
+}
+
+fn checkpoint_sql_block(spec: &MigrationSpec) -> String {
+    let checkpoint = MigrationCheckpointConfig::new("${IRODORI_MIGRATION_ID}", &spec.target_table);
+    join_blocks([
+        statement(&chunk_manifest_table_sql(
+            spec.target_engine,
+            &checkpoint.chunk_table,
+        )),
+        statement(&checkpoint_table_sql(
+            spec.target_engine,
+            &checkpoint.checkpoint_table,
+        )),
+        statement(&checkpoint_resume_sql(spec.target_engine, &checkpoint)),
+        statement(&checkpoint_mark_completed_sql(
+            spec.target_engine,
+            &checkpoint,
+        )),
+    ])
+}
+
 fn normalized_column_text_value(
     engine: MigrationEngine,
     column: &str,
@@ -1923,6 +2468,14 @@ fn limit_clause(engine: MigrationEngine, value: usize) -> String {
     }
 }
 
+fn single_row_limit_clause(engine: MigrationEngine) -> String {
+    if engine == MigrationEngine::Oracle {
+        "FETCH FIRST 1 ROW ONLY".to_string()
+    } else {
+        "LIMIT 1".to_string()
+    }
+}
+
 fn string_type(engine: MigrationEngine) -> &'static str {
     match engine {
         MigrationEngine::Oracle => "VARCHAR2(4000)",
@@ -1931,6 +2484,126 @@ fn string_type(engine: MigrationEngine) -> &'static str {
         MigrationEngine::Snowflake => "STRING",
         _ => "TEXT",
     }
+}
+
+fn integer_type(engine: MigrationEngine) -> &'static str {
+    match engine {
+        MigrationEngine::Oracle => "NUMBER",
+        _ => "BIGINT",
+    }
+}
+
+fn normalize_type_name(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn type_shape(value: &str) -> Option<&str> {
+    let start = value.find('(')?;
+    let end = value[start..].find(')')? + start;
+    Some(value[start + 1..end].trim())
+}
+
+fn string_ddl_type_for_source(target: MigrationEngine, source_type: &str) -> String {
+    let length = type_shape(source_type)
+        .and_then(|shape| shape.split(',').next())
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    match target {
+        MigrationEngine::Oracle => match length {
+            Some(len) if len <= 4000 => format!("VARCHAR2({len})"),
+            Some(_) => "CLOB".to_string(),
+            None => "CLOB".to_string(),
+        },
+        MigrationEngine::MySql | MigrationEngine::MariaDb => match length {
+            Some(len) if len <= 65_535 => format!("VARCHAR({len})"),
+            _ => "TEXT".to_string(),
+        },
+        MigrationEngine::Hive | MigrationEngine::Databricks => "STRING".to_string(),
+        MigrationEngine::Snowflake => length
+            .map(|len| format!("VARCHAR({len})"))
+            .unwrap_or_else(|| "STRING".to_string()),
+        _ => length
+            .map(|len| format!("VARCHAR({len})"))
+            .unwrap_or_else(|| "TEXT".to_string()),
+    }
+}
+
+fn integer_ddl_type(target: MigrationEngine, wide: bool) -> String {
+    match (target, wide) {
+        (MigrationEngine::Oracle, true) => "NUMBER(19,0)".to_string(),
+        (MigrationEngine::Oracle, false) => "NUMBER(10,0)".to_string(),
+        (MigrationEngine::Snowflake, true) => "NUMBER(19,0)".to_string(),
+        (MigrationEngine::Snowflake, false) => "NUMBER(10,0)".to_string(),
+        (_, true) => "BIGINT".to_string(),
+        (_, false) => "INTEGER".to_string(),
+    }
+}
+
+fn decimal_ddl_type(target: MigrationEngine, source_type: &str) -> String {
+    let shape = type_shape(source_type).unwrap_or("38,10");
+    match target {
+        MigrationEngine::Oracle | MigrationEngine::Snowflake => format!("NUMBER({shape})"),
+        _ => format!("DECIMAL({shape})"),
+    }
+}
+
+fn float_ddl_type(target: MigrationEngine, double: bool) -> String {
+    match (target, double) {
+        (MigrationEngine::Oracle, true) => "BINARY_DOUBLE".to_string(),
+        (MigrationEngine::Oracle, false) => "BINARY_FLOAT".to_string(),
+        (_, true) => "DOUBLE PRECISION".to_string(),
+        (_, false) => "REAL".to_string(),
+    }
+}
+
+fn boolean_ddl_type(target: MigrationEngine) -> String {
+    match target {
+        MigrationEngine::Oracle => "NUMBER(1,0)".to_string(),
+        _ => "BOOLEAN".to_string(),
+    }
+}
+
+fn timestamp_ddl_type(target: MigrationEngine) -> String {
+    match target {
+        MigrationEngine::Snowflake => "TIMESTAMP_NTZ".to_string(),
+        _ => "TIMESTAMP".to_string(),
+    }
+}
+
+fn bytes_ddl_type(target: MigrationEngine) -> String {
+    match target {
+        MigrationEngine::Postgres | MigrationEngine::Redshift => "BYTEA".to_string(),
+        MigrationEngine::Oracle => "BLOB".to_string(),
+        MigrationEngine::Snowflake => "BINARY".to_string(),
+        MigrationEngine::MySql | MigrationEngine::MariaDb => "BLOB".to_string(),
+        _ => "VARBINARY".to_string(),
+    }
+}
+
+fn uuid_ddl_type(target: MigrationEngine) -> String {
+    match target {
+        MigrationEngine::Postgres | MigrationEngine::DuckDb => "UUID".to_string(),
+        _ => "VARCHAR(36)".to_string(),
+    }
+}
+
+fn json_ddl_type(target: MigrationEngine) -> String {
+    match target {
+        MigrationEngine::Postgres => "JSONB".to_string(),
+        MigrationEngine::MySql | MigrationEngine::MariaDb => "JSON".to_string(),
+        MigrationEngine::Snowflake => "VARIANT".to_string(),
+        MigrationEngine::Oracle => "CLOB".to_string(),
+        MigrationEngine::Hive | MigrationEngine::Databricks => "STRING".to_string(),
+        _ => "JSON".to_string(),
+    }
+}
+
+fn sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn statement(sql: &str) -> String {

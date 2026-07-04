@@ -33,6 +33,31 @@ pub struct RolloutPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationValidationSummary {
+    pub source_row_count: u64,
+    pub target_row_count: u64,
+    pub source_key_count: u64,
+    pub target_key_count: u64,
+    pub failed_chunk_count: u64,
+    pub row_diff_count: u64,
+    pub shadow_mismatch_count: u64,
+}
+
+impl MigrationValidationSummary {
+    pub fn passes_checksum_gates(&self) -> bool {
+        self.source_row_count == self.target_row_count
+            && self.source_key_count == self.target_key_count
+            && self.failed_chunk_count == 0
+    }
+
+    pub fn passes_cutover_gates(&self) -> bool {
+        self.passes_checksum_gates()
+            && self.row_diff_count == 0
+            && self.shadow_mismatch_count == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowReadExperiment {
     pub name: String,
     pub control_query: String,
@@ -113,6 +138,69 @@ pub fn expand_contract_rollout(title: impl Into<String>) -> RolloutPlan {
     }
 }
 
+pub fn validation_rollout_gates(summary: &MigrationValidationSummary) -> Vec<RolloutGate> {
+    vec![
+        gate(
+            "Row count parity",
+            &format!(
+                "source_row_count = target_row_count ({} = {})",
+                summary.source_row_count, summary.target_row_count
+            ),
+            "pause workers and keep dual-write enabled",
+        ),
+        gate(
+            "Key count parity",
+            &format!(
+                "source_key_count = target_key_count ({} = {})",
+                summary.source_key_count, summary.target_key_count
+            ),
+            "inspect duplicate or missing business keys before continuing",
+        ),
+        gate(
+            "Chunk checksum parity",
+            &format!("failed_chunk_count = 0 ({})", summary.failed_chunk_count),
+            "recurse into failed chunks and keep candidate reads disabled",
+        ),
+        gate(
+            "Final row diff",
+            &format!("row_diff_count = 0 ({})", summary.row_diff_count),
+            "switch feature flag back and repair only mismatched rows",
+        ),
+        gate(
+            "Shadow read parity",
+            &format!(
+                "shadow_mismatch_count = 0 ({})",
+                summary.shadow_mismatch_count
+            ),
+            "keep control read path",
+        ),
+    ]
+}
+
+pub fn attach_validation_gates(
+    mut plan: RolloutPlan,
+    summary: &MigrationValidationSummary,
+) -> RolloutPlan {
+    let gates = validation_rollout_gates(summary);
+    for step in &mut plan.steps {
+        match step.phase {
+            RolloutPhase::Backfill => {
+                step.gates.extend(gates.iter().take(3).cloned());
+            }
+            RolloutPhase::Cutover => {
+                step.gates.extend(gates.iter().skip(2).cloned());
+            }
+            RolloutPhase::ShadowRead => {
+                if let Some(gate) = gates.iter().find(|gate| gate.name == "Shadow read parity") {
+                    step.gates.push(gate.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    plan
+}
+
 pub fn shadow_read_runbook(experiment: &ShadowReadExperiment) -> String {
     [
         format!("# Shadow Read: {}", experiment.name),
@@ -171,5 +259,40 @@ mod tests {
         assert!(runbook.contains("Return control query results"));
         assert!(runbook.contains("select * from old_orders"));
         assert!(runbook.contains("select * from new_orders"));
+    }
+
+    #[test]
+    fn validation_summary_attaches_checksum_and_diff_gates() {
+        let summary = MigrationValidationSummary {
+            source_row_count: 100,
+            target_row_count: 100,
+            source_key_count: 100,
+            target_key_count: 100,
+            failed_chunk_count: 0,
+            row_diff_count: 0,
+            shadow_mismatch_count: 0,
+        };
+
+        let plan = attach_validation_gates(expand_contract_rollout("orders"), &summary);
+        let backfill = plan
+            .steps
+            .iter()
+            .find(|step| step.phase == RolloutPhase::Backfill)
+            .expect("backfill step");
+        let cutover = plan
+            .steps
+            .iter()
+            .find(|step| step.phase == RolloutPhase::Cutover)
+            .expect("cutover step");
+
+        assert!(summary.passes_cutover_gates());
+        assert!(backfill
+            .gates
+            .iter()
+            .any(|gate| gate.name == "Chunk checksum parity"));
+        assert!(cutover
+            .gates
+            .iter()
+            .any(|gate| gate.check.contains("row_diff_count = 0")));
     }
 }
