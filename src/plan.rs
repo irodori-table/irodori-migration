@@ -1927,10 +1927,6 @@ fn statement(sql: &str) -> String {
     }
 }
 
-fn sql_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 fn indent(value: &str) -> String {
     value
         .split('\n')
@@ -1988,7 +1984,8 @@ mod tests {
             .source_sql
             .contains("INSERT OVERWRITE DIRECTORY '${EXPORT_PATH}'"));
         assert!(plan.source_sql.contains("STORED AS PARQUET"));
-        assert!(plan.source_sql.contains("LOWER(MD5(CONCAT_WS"));
+        assert!(plan.source_sql.contains("LOWER(MD5(CONCAT("));
+        assert!(plan.source_sql.contains("'V'"));
         assert!(plan.source_sql.contains("sales_dt AS irodori_partition"));
         assert!(plan.source_sql.contains("irodori_key_hash"));
         assert!(plan.source_sql.contains("Partition fingerprint"));

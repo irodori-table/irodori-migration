@@ -1359,6 +1359,15 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
     }
 
     #[test]
+    #[cfg(feature = "avro")]
+    fn avro_rejects_invalid_field_names_without_panic() {
+        let mut out = Vec::new();
+        let error = AvroEncoder::new(&mut out, &["bad-name"]).expect_err("invalid avro name");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     #[cfg(feature = "parquet")]
     fn parquet_round_trip() {
         let mut out = Vec::new();
