@@ -160,6 +160,7 @@ fn postgres_and_mysql_row_hashes_match_for_same_data() -> TestResult {
             "amount".to_string(),
             "status".to_string(),
         ],
+        partition_column: String::new(),
         normalize_whitespace: true,
         ..MigrationSpec::default()
     };
