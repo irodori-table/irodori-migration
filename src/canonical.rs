@@ -6,6 +6,7 @@
 //! comparisons before running hashes.
 
 use crate::plan::MigrationEngine;
+use crate::sql_ref::column_ref;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimestampMode {
@@ -84,6 +85,18 @@ pub fn canonical_row_sql(
     concat_sql(engine, &cells, &policy.delimiter)
 }
 
+pub(crate) fn canonical_row_from_values_sql(
+    engine: MigrationEngine,
+    values: &[String],
+    policy: &CanonicalizationPolicy,
+) -> String {
+    let cells = values
+        .iter()
+        .map(|value| canonical_cell_from_value_sql(engine, value, policy))
+        .collect::<Vec<_>>();
+    concat_sql(engine, &cells, &policy.delimiter)
+}
+
 pub fn canonical_cell_sql(
     engine: MigrationEngine,
     column: &CanonicalColumn,
@@ -97,18 +110,39 @@ pub fn canonical_cell_sql(
         value
     };
     if policy.length_prefix_values {
-        let payload = concat_raw_sql(
-            engine,
-            &[length_sql(engine, &value), sql_string(":"), value.clone()],
-        );
-        format!(
-            "CASE WHEN {value} IS NULL THEN {} ELSE {} END",
-            sql_string(&policy.null_token),
-            concat_raw_sql(engine, &[sql_string("V"), payload])
-        )
+        length_prefixed_cell_sql(engine, &value, &policy.null_token)
     } else {
         format!("COALESCE({value}, {})", sql_string(&policy.null_token))
     }
+}
+
+fn canonical_cell_from_value_sql(
+    engine: MigrationEngine,
+    value: &str,
+    policy: &CanonicalizationPolicy,
+) -> String {
+    let value = if should_empty_string_be_null(engine, policy) {
+        format!("NULLIF({value}, '')")
+    } else {
+        value.to_string()
+    };
+    if policy.length_prefix_values {
+        length_prefixed_cell_sql(engine, &value, &policy.null_token)
+    } else {
+        format!("COALESCE({value}, {})", sql_string(&policy.null_token))
+    }
+}
+
+fn length_prefixed_cell_sql(engine: MigrationEngine, value: &str, null_token: &str) -> String {
+    let payload = concat_raw_sql(
+        engine,
+        &[length_sql(engine, value), sql_string(":"), value.to_string()],
+    );
+    format!(
+        "CASE WHEN {value} IS NULL THEN {} ELSE {} END",
+        sql_string(null_token),
+        concat_raw_sql(engine, &[sql_string("V"), payload])
+    )
 }
 
 pub fn canonical_value_sql(
@@ -383,37 +417,6 @@ fn decimal_format(scale: u8) -> String {
             "FM99999999999999999999999999999999999990.{}",
             "0".repeat(usize::from(scale))
         )
-    }
-}
-
-fn column_ref(engine: MigrationEngine, name: &str) -> String {
-    if name.contains('.') {
-        return name
-            .split('.')
-            .map(|part| identifier_ref(engine, part))
-            .collect::<Vec<_>>()
-            .join(".");
-    }
-    identifier_ref(engine, name)
-}
-
-fn identifier_ref(engine: MigrationEngine, value: &str) -> String {
-    let simple = value.chars().enumerate().all(|(index, ch)| {
-        ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || !ch.is_ascii_digit())
-    });
-    let keyword = matches!(
-        value.to_ascii_lowercase().as_str(),
-        "select" | "from" | "where" | "group" | "order" | "table"
-    );
-    if simple && !keyword {
-        value.to_string()
-    } else if matches!(
-        engine,
-        MigrationEngine::MySql | MigrationEngine::MariaDb | MigrationEngine::Hive
-    ) {
-        format!("`{}`", value.replace('`', "``"))
-    } else {
-        format!("\"{}\"", value.replace('"', "\"\""))
     }
 }
 

@@ -15,6 +15,7 @@ pub mod plan;
 pub mod recipe;
 pub mod rollout;
 pub mod schema;
+mod sql_ref;
 
 pub use canonical::{
     canonical_cell_sql, canonical_row_sql, canonical_value_sql, canonicalization_warnings,

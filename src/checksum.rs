@@ -2,6 +2,7 @@
 
 use crate::canonical::{canonical_row_sql, CanonicalColumn, CanonicalizationPolicy};
 use crate::plan::MigrationEngine;
+use crate::sql_ref::{column_ref, table_ref};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChecksumFunction {
@@ -311,29 +312,6 @@ fn chunk_predicate(engine: MigrationEngine, bounds: &ChunkBounds) -> String {
         parts.push(format!("{column} {op} {upper}"));
     }
     parts.join(" AND ")
-}
-
-fn table_ref(engine: MigrationEngine, name: &str) -> String {
-    name.split('.')
-        .map(|part| column_ref(engine, part))
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-fn column_ref(engine: MigrationEngine, name: &str) -> String {
-    let simple = name.chars().enumerate().all(|(index, ch)| {
-        ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || !ch.is_ascii_digit())
-    });
-    if simple {
-        name.to_string()
-    } else if matches!(
-        engine,
-        MigrationEngine::MySql | MigrationEngine::MariaDb | MigrationEngine::Hive
-    ) {
-        format!("`{}`", name.replace('`', "``"))
-    } else {
-        format!("\"{}\"", name.replace('"', "\"\""))
-    }
 }
 
 fn string_type(engine: MigrationEngine) -> &'static str {

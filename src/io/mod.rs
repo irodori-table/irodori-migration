@@ -692,78 +692,100 @@ impl<W: Write> TabularEncoder for NdjsonEncoder<W> {
 
 #[cfg(feature = "avro")]
 pub struct AvroEncoder<W: Write> {
-    writer: apache_avro::Writer<'static, W>,
+    writer: Option<W>,
+    schema: apache_avro::Schema,
     columns: Vec<String>,
+    buffered_rows: Vec<Vec<OwnedCell>>,
 }
 
 #[cfg(feature = "avro")]
 impl<W: Write> AvroEncoder<W> {
     pub fn new(writer: W, columns: &[impl AsRef<str>]) -> io::Result<Self> {
         let cols: Vec<String> = columns.iter().map(|c| c.as_ref().to_string()).collect();
-        let fields: Vec<String> = cols
+        let fields = cols
             .iter()
             .map(|col| {
-                format!(
-                    r#"{{"name": "{}", "type": ["null", "boolean", "long", "double", "string"]}}"#,
-                    col
-                )
+                serde_json::json!({
+                    "name": col,
+                    "type": ["null", "boolean", "long", "double", "string"],
+                })
             })
-            .collect();
-        let schema_json = format!(
-            r#"{{"type": "record", "name": "row", "fields": [{}]}}"#,
-            fields.join(", ")
-        );
-        let schema = apache_avro::Schema::parse_str(&schema_json)
+            .collect::<Vec<_>>();
+        let schema_json = serde_json::json!({
+            "type": "record",
+            "name": "row",
+            "fields": fields,
+        });
+        let schema = apache_avro::Schema::parse_str(&schema_json.to_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-        let schema = Box::leak(Box::new(schema));
-        let avro_writer = apache_avro::Writer::new(schema, writer);
         Ok(Self {
-            writer: avro_writer,
+            writer: Some(writer),
+            schema,
             columns: cols,
+            buffered_rows: Vec::new(),
         })
     }
 
     pub fn write_row(&mut self, row: &[Cell<'_>]) -> io::Result<()> {
-        let mut record = apache_avro::types::Record::new(self.writer.schema()).unwrap();
-        for (idx, cell) in row.iter().enumerate() {
-            if let Some(col_name) = self.columns.get(idx) {
-                let val = match cell {
-                    Cell::Null => apache_avro::types::Value::Union(
-                        0,
-                        Box::new(apache_avro::types::Value::Null),
-                    ),
-                    Cell::Bool(b) => apache_avro::types::Value::Union(
-                        1,
-                        Box::new(apache_avro::types::Value::Boolean(*b)),
-                    ),
-                    Cell::Integer(i) => apache_avro::types::Value::Union(
-                        2,
-                        Box::new(apache_avro::types::Value::Long(*i)),
-                    ),
-                    Cell::Float(f) => apache_avro::types::Value::Union(
-                        3,
-                        Box::new(apache_avro::types::Value::Double(*f)),
-                    ),
-                    Cell::Text(s) | Cell::Object(s) => apache_avro::types::Value::Union(
-                        4,
-                        Box::new(apache_avro::types::Value::String(s.to_string())),
-                    ),
-                };
-                record.put(col_name, val);
-            }
-        }
-        self.writer
-            .append(record)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.buffered_rows
+            .push(row.iter().map(|cell| cell.to_owned()).collect());
         Ok(())
     }
 
     pub fn finish(&mut self) -> io::Result<()> {
-        self.writer
+        let Some(writer) = self.writer.take() else {
+            return Ok(());
+        };
+        let mut avro_writer = apache_avro::Writer::new(&self.schema, writer);
+        for row in &self.buffered_rows {
+            avro_writer
+                .append(avro_record(&self.columns, row))
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        self.buffered_rows.clear();
+        avro_writer
             .flush()
             .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(feature = "avro")]
+fn avro_record(columns: &[String], row: &[OwnedCell]) -> apache_avro::types::Value {
+    apache_avro::types::Value::Record(
+        row.iter()
+            .enumerate()
+            .filter_map(|(idx, cell)| {
+                let column = columns.get(idx)?;
+                Some((column.clone(), avro_cell(cell)))
+            })
+            .collect(),
+    )
+}
+
+#[cfg(feature = "avro")]
+fn avro_cell(cell: &OwnedCell) -> apache_avro::types::Value {
+    match cell {
+        OwnedCell::Null => {
+            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null))
+        }
+        OwnedCell::Bool(value) => apache_avro::types::Value::Union(
+            1,
+            Box::new(apache_avro::types::Value::Boolean(*value)),
+        ),
+        OwnedCell::Integer(value) => apache_avro::types::Value::Union(
+            2,
+            Box::new(apache_avro::types::Value::Long(*value)),
+        ),
+        OwnedCell::Float(value) => apache_avro::types::Value::Union(
+            3,
+            Box::new(apache_avro::types::Value::Double(*value)),
+        ),
+        OwnedCell::Text(value) => apache_avro::types::Value::Union(
+            4,
+            Box::new(apache_avro::types::Value::String(value.to_string())),
+        ),
     }
 }
 

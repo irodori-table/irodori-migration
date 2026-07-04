@@ -6,6 +6,9 @@
 
 use std::collections::HashSet;
 
+use crate::canonical::{canonical_row_from_values_sql, CanonicalizationPolicy};
+use crate::sql_ref::{column_ref, identifier_ref, table_ref};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MigrationEngine {
     Postgres,
@@ -44,9 +47,6 @@ impl MigrationEngine {
         matches!(self, Self::Iceberg | Self::S3Tables)
     }
 
-    fn uses_backticks(self) -> bool {
-        matches!(self, Self::MySql | Self::MariaDb | Self::Hive)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,18 +524,13 @@ pub fn row_hash_expression(
     }
     let values = columns
         .iter()
-        .map(|column| normalized_column_value(engine, column, spec))
+        .map(|column| normalized_column_text_value(engine, column, spec))
         .collect::<Vec<_>>();
-    let concatenated = concat_expression(engine, &values, &spec.delimiter);
-
+    let concatenated = canonical_row_from_values_sql(engine, &values, &canonical_policy(spec));
     match engine {
         MigrationEngine::Oracle => {
-            format!("LOWER(RAWTOHEX(STANDARD_HASH({concatenated}, 'SHA256')))")
+            format!("LOWER(RAWTOHEX(STANDARD_HASH({concatenated}, 'MD5')))")
         }
-        MigrationEngine::MySql | MigrationEngine::MariaDb => {
-            format!("LOWER(SHA2({concatenated}, 256))")
-        }
-        MigrationEngine::Snowflake => format!("LOWER(SHA2({concatenated}, 256))"),
         MigrationEngine::TrinoPresto => format!("LOWER(TO_HEX(MD5(TO_UTF8({concatenated}))))"),
         _ => format!("LOWER(MD5({concatenated}))"),
     }
@@ -1511,7 +1506,11 @@ fn snowflake_load_sql(spec: &MigrationSpec) -> String {
     .join("\n")
 }
 
-fn normalized_column_value(engine: MigrationEngine, column: &str, spec: &MigrationSpec) -> String {
+fn normalized_column_text_value(
+    engine: MigrationEngine,
+    column: &str,
+    spec: &MigrationSpec,
+) -> String {
     let reference = column_ref(engine, column);
     let mut value = match engine {
         MigrationEngine::Postgres | MigrationEngine::Redshift => {
@@ -1534,7 +1533,7 @@ fn normalized_column_value(engine: MigrationEngine, column: &str, spec: &Migrati
     if spec.normalize_case {
         value = format!("LOWER({value})");
     }
-    format!("COALESCE({value}, {})", sql_string(&spec.null_token))
+    value
 }
 
 fn regexp_replace_whitespace(engine: MigrationEngine, value: &str) -> String {
@@ -1546,20 +1545,6 @@ fn regexp_replace_whitespace(engine: MigrationEngine, value: &str) -> String {
     } else {
         format!("REGEXP_REPLACE({value}, '\\s+', ' ')")
     }
-}
-
-fn concat_expression(engine: MigrationEngine, values: &[String], delimiter: &str) -> String {
-    if values.is_empty() {
-        return "''".to_string();
-    }
-    if engine == MigrationEngine::Oracle {
-        return values.join(&format!(" || {} || ", sql_string(delimiter)));
-    }
-    format!(
-        "CONCAT_WS({}, {})",
-        sql_string(delimiter),
-        values.join(", ")
-    )
 }
 
 fn partition_fingerprint_block(
@@ -1587,7 +1572,7 @@ fn key_count_projection(engine: MigrationEngine, keys: &[String]) -> String {
     let key_values = keys
         .iter()
         .map(|key| {
-            normalized_column_value(
+            normalized_column_text_value(
                 engine,
                 key,
                 &MigrationSpec {
@@ -1602,8 +1587,19 @@ fn key_count_projection(engine: MigrationEngine, keys: &[String]) -> String {
         .collect::<Vec<_>>();
     format!(
         "COUNT(DISTINCT {}) AS key_count,",
-        concat_expression(engine, &key_values, "|#|")
+        canonical_row_from_values_sql(engine, &key_values, &CanonicalizationPolicy::default())
     )
+}
+
+fn canonical_policy(spec: &MigrationSpec) -> CanonicalizationPolicy {
+    CanonicalizationPolicy {
+        null_token: spec.null_token.clone(),
+        delimiter: spec.delimiter.clone(),
+        trim_strings: false,
+        normalize_case: false,
+        empty_string_is_null: false,
+        length_prefix_values: true,
+    }
 }
 
 fn build_warnings(
@@ -1901,56 +1897,6 @@ fn positional_order_by(width: usize) -> String {
         .map(|index| index.to_string())
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn table_ref(engine: MigrationEngine, name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return "(missing_table)".to_string();
-    }
-    trimmed
-        .split('.')
-        .map(|part| identifier_ref(engine, part))
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-fn column_ref(engine: MigrationEngine, name: &str) -> String {
-    name.split('.')
-        .map(|part| identifier_ref(engine, part))
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-fn identifier_ref(engine: MigrationEngine, value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return "\"\"".to_string();
-    }
-    if trimmed.starts_with('"')
-        || trimmed.starts_with('`')
-        || trimmed.contains('(')
-        || trimmed.contains(')')
-    {
-        return trimmed.to_string();
-    }
-    if is_simple_identifier(trimmed) {
-        return trimmed.to_string();
-    }
-    let quote = if engine.uses_backticks() { '`' } else { '"' };
-    format!(
-        "{quote}{}{quote}",
-        trimmed.replace(quote, &format!("{quote}{quote}"))
-    )
-}
-
-fn is_simple_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
 }
 
 fn limit_clause(engine: MigrationEngine, value: usize) -> String {
