@@ -55,8 +55,10 @@ pub use rollout::{
     RolloutStep, ShadowReadExperiment,
 };
 pub use schema::{
-    diff_schemas, AlterColumnStyle, AlteredColumn, AlteredTable, Column, ColumnChange, Index,
-    MigrationScript, MigrationStatement, Schema, SchemaDiff, Table,
+    diff_schemas, AlterColumnStyle, AlteredColumn, AlteredTable, CheckConstraint, Column,
+    ColumnChange, ForeignKeyConstraint, Index, MigrationScript, MigrationStatement,
+    PrimaryKeyChange, Rename, RenameHint, Schema, SchemaDiff, Table, TableConstraint,
+    UniqueConstraint, UnsupportedMigration,
 };
 
 #[cfg(feature = "avro")]

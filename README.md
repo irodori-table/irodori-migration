@@ -15,6 +15,10 @@ database connections or stores credentials.
 - migration runbooks
 - row-hash and checksum SQL
 - bucket and row-level diff SQL
+- chunk iteration and checkpoint/resume SQL
+- FK-aware load ordering
+- cross-engine target DDL/type mapping helpers
+- rollout gates backed by validation summaries
 - CSV, TSV, SQL, JSON, NDJSON, Avro, and Parquet export helpers
 - progress and cancellation hooks for host job systems
 
@@ -22,7 +26,7 @@ database connections or stores credentials.
 
 ```toml
 [dependencies]
-irodori-migration = "0.2"
+irodori-migration = "0.3"
 ```
 
 ```rust

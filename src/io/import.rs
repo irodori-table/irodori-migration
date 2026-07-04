@@ -2,7 +2,7 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use super::OwnedCell;
+use super::{dialect_uses_backslash_escapes, sql_string_literal, OwnedCell};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferredColumn {
@@ -123,24 +123,27 @@ pub fn preview_json(input: &str, options: ImportPreviewOptions) -> io::Result<Im
             ));
         }
     };
-    preview_json_values(rows.into_iter(), options.max_rows)
+    preview_json_values(rows.into_iter().map(Ok), options.max_rows)
 }
 
 pub fn preview_ndjson(input: &str, options: ImportPreviewOptions) -> io::Result<ImportPreview> {
-    let mut values = Vec::new();
-    for (line_index, line) in input.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid NDJSON at line {}: {error}", line_index + 1),
-            )
-        })?;
-        values.push(value);
-    }
-    preview_json_values(values.into_iter(), options.max_rows)
+    preview_json_values(
+        input.lines().enumerate().filter_map(|(line_index, line)| {
+            if line.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid NDJSON at line {}: {error}", line_index + 1),
+                        )
+                    }),
+                )
+            }
+        }),
+        options.max_rows,
+    )
 }
 
 pub fn preview_delimited<R: io::Read>(
@@ -156,7 +159,7 @@ pub fn preview_delimited<R: io::Read>(
     let headers = if options.has_header {
         rdr.headers()?
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| strip_utf8_bom(s).to_string())
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -165,36 +168,52 @@ pub fn preview_delimited<R: io::Read>(
     let mut record = csv::StringRecord::new();
     let mut rows = Vec::new();
     let mut width = headers.len();
+    let mut inferred_types = vec![InferredType::Null; width];
     let mut total_rows_seen = 0;
     while rdr.read_record(&mut record)? {
-        if width == 0 {
+        if width == 0 || record.len() > width {
             width = record.len();
+            inferred_types.resize(width, InferredType::Null);
         }
         total_rows_seen += 1;
+        for (index, inferred_type) in inferred_types.iter_mut().enumerate().take(width) {
+            let cell = infer_delimited_cell(
+                record.get(index).map(strip_utf8_bom).unwrap_or_default(),
+                &options.null_values,
+            )?;
+            *inferred_type = merge_types(*inferred_type, cell_type(&cell));
+        }
         if rows.len() < options.preview.max_rows {
             rows.push(
                 (0..width)
                     .map(|index| {
                         infer_delimited_cell(
-                            record.get(index).unwrap_or_default(),
+                            record.get(index).map(strip_utf8_bom).unwrap_or_default(),
                             &options.null_values,
                         )
                     })
-                    .collect::<Vec<_>>(),
+                    .collect::<io::Result<Vec<_>>>()?,
             );
         }
     }
 
-    let headers = if options.has_header {
+    let mut headers = if options.has_header {
         headers
     } else {
         (0..width)
             .map(|index| format!("column_{}", index + 1))
             .collect()
     };
-    Ok(build_preview(
+    if headers.len() < width {
+        headers.extend((headers.len()..width).map(|index| format!("column_{}", index + 1)));
+    }
+    for row in &mut rows {
+        row.resize(width, OwnedCell::Null);
+    }
+    Ok(build_preview_with_types(
         headers,
         rows,
+        inferred_types,
         total_rows_seen,
         total_rows_seen > options.preview.max_rows,
     ))
@@ -213,7 +232,7 @@ pub fn infer_csv_schema<R: io::Read>(
     let headers = if has_header {
         rdr.headers()?
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| strip_utf8_bom(s).to_string())
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -241,37 +260,22 @@ pub fn infer_csv_schema<R: io::Read>(
 
     let mut inferred = Vec::new();
     for col_idx in 0..num_cols {
-        let mut is_bool = true;
-        let mut is_int = true;
-        let mut is_float = true;
-        let mut has_vals = false;
+        let mut inferred_type = InferredType::Null;
 
         for row in &sampled_rows {
             if let Some(val) = row.get(col_idx) {
-                let trimmed = val.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                has_vals = true;
-                if trimmed.to_lowercase() != "true" && trimmed.to_lowercase() != "false" {
-                    is_bool = false;
-                }
-                if trimmed.parse::<i64>().is_err() {
-                    is_int = false;
-                }
-                if trimmed.parse::<f64>().is_err() {
-                    is_float = false;
-                }
+                let cell = infer_delimited_cell(strip_utf8_bom(val), &[String::new()])?;
+                inferred_type = merge_types(inferred_type, cell_type(&cell));
             }
         }
 
-        let dtype = if !has_vals {
+        let dtype = if inferred_type == InferredType::Null {
             "text"
-        } else if is_bool {
+        } else if inferred_type == InferredType::Bool {
             "boolean"
-        } else if is_int {
+        } else if inferred_type == InferredType::Integer {
             "integer"
-        } else if is_float {
+        } else if inferred_type == InferredType::Float {
             "double"
         } else {
             "text"
@@ -305,7 +309,7 @@ pub fn generate_inserts_from_csv<R: io::Read, W: io::Write>(
     let headers = if has_header {
         rdr.headers()?
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| strip_utf8_bom(s).to_string())
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -316,10 +320,19 @@ pub fn generate_inserts_from_csv<R: io::Read, W: io::Write>(
     let mut count = 0;
 
     let quoted_table = dialect.quote_identifier(table_name);
+    let backslash_escapes = dialect_uses_backslash_escapes(dialect);
 
     while rdr.read_record(&mut record)? {
         if num_cols == 0 {
             num_cols = record.len();
+        } else if record.len() != num_cols {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CSV row has {} fields but expected {num_cols}",
+                    record.len()
+                ),
+            ));
         }
         let col_names = if has_header {
             headers.clone()
@@ -335,19 +348,7 @@ pub fn generate_inserts_from_csv<R: io::Read, W: io::Write>(
 
         let mut vals = Vec::new();
         for val in record.iter() {
-            let trimmed = val.trim();
-            if trimmed.is_empty() || trimmed.to_lowercase() == "null" {
-                vals.push("NULL".to_string());
-            } else if trimmed.to_lowercase() == "true" {
-                vals.push("true".to_string());
-            } else if trimmed.to_lowercase() == "false" {
-                vals.push("false".to_string());
-            } else if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
-                vals.push(trimmed.to_string());
-            } else {
-                let escaped = trimmed.replace('\'', "''");
-                vals.push(format!("'{escaped}'"));
-            }
+            vals.push(delimited_value_to_sql(val, backslash_escapes)?);
         }
         let vals_str = vals.join(", ");
 
@@ -362,15 +363,44 @@ pub fn generate_inserts_from_csv<R: io::Read, W: io::Write>(
     Ok(count)
 }
 
+fn delimited_value_to_sql(value: &str, backslash_escapes: bool) -> io::Result<String> {
+    let value = strip_utf8_bom(value);
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        Ok("NULL".to_string())
+    } else if trimmed.eq_ignore_ascii_case("true") {
+        Ok("TRUE".to_string())
+    } else if trimmed.eq_ignore_ascii_case("false") {
+        Ok("FALSE".to_string())
+    } else if is_lossy_integer_text(trimmed) {
+        Ok(sql_string_literal(trimmed, backslash_escapes))
+    } else if is_integer_like(trimmed) {
+        trimmed
+            .parse::<i64>()
+            .map(|_| trimmed.to_string())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "integer is out of range"))
+    } else if let Ok(parsed) = trimmed.parse::<f64>() {
+        if parsed.is_finite() {
+            Ok(trimmed.to_string())
+        } else {
+            Err(non_finite_import_error())
+        }
+    } else {
+        Ok(sql_string_literal(trimmed, backslash_escapes))
+    }
+}
+
 fn preview_json_values(
-    values: impl Iterator<Item = serde_json::Value>,
+    values: impl Iterator<Item = io::Result<serde_json::Value>>,
     max_rows: usize,
 ) -> io::Result<ImportPreview> {
     let mut headers = Vec::<String>::new();
     let mut rows = Vec::<Vec<(String, OwnedCell)>>::new();
+    let mut inferred_types = Vec::<InferredType>::new();
     let mut total_rows_seen = 0;
 
     for value in values {
+        let value = value?;
         let serde_json::Value::Object(map) = value else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -378,14 +408,24 @@ fn preview_json_values(
             ));
         };
         total_rows_seen += 1;
-        if total_rows_seen <= max_rows {
-            let mut row = Vec::new();
-            for (key, value) in map {
-                if !headers.iter().any(|existing| existing == &key) {
+        let keep_row = total_rows_seen <= max_rows;
+        let mut row = Vec::new();
+        for (key, value) in map {
+            let index = match headers.iter().position(|existing| existing == &key) {
+                Some(index) => index,
+                None => {
                     headers.push(key.clone());
+                    inferred_types.push(InferredType::Null);
+                    headers.len() - 1
                 }
-                row.push((key, owned_cell_from_json(value)));
+            };
+            let cell = owned_cell_from_json(value)?;
+            inferred_types[index] = merge_types(inferred_types[index], cell_type(&cell));
+            if keep_row {
+                row.push((key, cell));
             }
+        }
+        if total_rows_seen <= max_rows {
             rows.push(row);
         }
     }
@@ -405,17 +445,19 @@ fn preview_json_values(
         })
         .collect::<Vec<_>>();
 
-    Ok(build_preview(
+    Ok(build_preview_with_types(
         headers,
         preview_rows,
+        inferred_types,
         total_rows_seen,
         total_rows_seen > max_rows,
     ))
 }
 
-fn build_preview(
+fn build_preview_with_types(
     headers: Vec<String>,
     rows: Vec<Vec<OwnedCell>>,
+    inferred_types: Vec<InferredType>,
     total_rows_seen: usize,
     truncated: bool,
 ) -> ImportPreview {
@@ -423,7 +465,10 @@ fn build_preview(
         .into_iter()
         .enumerate()
         .map(|(index, source_name)| {
-            let inferred_type = infer_column_type(rows.iter().filter_map(|row| row.get(index)));
+            let inferred_type = inferred_types
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| infer_column_type(rows.iter().filter_map(|row| row.get(index))));
             ImportColumn {
                 target_name: sanitize_column_name(&source_name, index),
                 source_name,
@@ -439,15 +484,21 @@ fn build_preview(
     }
 }
 
-fn owned_cell_from_json(value: serde_json::Value) -> OwnedCell {
-    match value {
+fn owned_cell_from_json(value: serde_json::Value) -> io::Result<OwnedCell> {
+    Ok(match value {
         serde_json::Value::Null => OwnedCell::Null,
         serde_json::Value::Bool(value) => OwnedCell::Bool(value),
         serde_json::Value::Number(value) => {
             if let Some(value) = value.as_i64() {
                 OwnedCell::Integer(value)
+            } else if value.as_u64().is_some() {
+                OwnedCell::Text(value.to_string())
             } else if let Some(value) = value.as_f64() {
-                OwnedCell::Float(value)
+                if value.is_finite() {
+                    OwnedCell::Float(value)
+                } else {
+                    return Err(non_finite_import_error());
+                }
             } else {
                 OwnedCell::Text(value.to_string())
             }
@@ -456,24 +507,34 @@ fn owned_cell_from_json(value: serde_json::Value) -> OwnedCell {
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
             OwnedCell::Text(value.to_string())
         }
-    }
+    })
 }
 
-fn infer_delimited_cell(value: &str, null_values: &[String]) -> OwnedCell {
+fn infer_delimited_cell(value: &str, null_values: &[String]) -> io::Result<OwnedCell> {
+    let value = strip_utf8_bom(value);
     if null_values.iter().any(|null_value| null_value == value) {
-        return OwnedCell::Null;
+        return Ok(OwnedCell::Null);
     }
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("true") {
-        OwnedCell::Bool(true)
+        Ok(OwnedCell::Bool(true))
     } else if trimmed.eq_ignore_ascii_case("false") {
-        OwnedCell::Bool(false)
-    } else if let Ok(value) = trimmed.parse::<i64>() {
-        OwnedCell::Integer(value)
-    } else if let Ok(value) = trimmed.parse::<f64>() {
-        OwnedCell::Float(value)
+        Ok(OwnedCell::Bool(false))
+    } else if is_lossy_integer_text(trimmed) {
+        Ok(OwnedCell::Text(value.to_string()))
+    } else if is_integer_like(trimmed) {
+        trimmed
+            .parse::<i64>()
+            .map(OwnedCell::Integer)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "integer is out of range"))
+    } else if let Ok(parsed) = trimmed.parse::<f64>() {
+        if parsed.is_finite() {
+            Ok(OwnedCell::Float(parsed))
+        } else {
+            Err(non_finite_import_error())
+        }
     } else {
-        OwnedCell::Text(value.to_string())
+        Ok(OwnedCell::Text(value.to_string()))
     }
 }
 
@@ -501,6 +562,34 @@ fn merge_types(left: InferredType, right: InferredType) -> InferredType {
         (same_left, same_right) if same_left == same_right => same_left,
         _ => InferredType::Text,
     }
+}
+
+fn strip_utf8_bom(value: &str) -> &str {
+    value.strip_prefix('\u{feff}').unwrap_or(value)
+}
+
+fn is_lossy_integer_text(value: &str) -> bool {
+    is_integer_like(value) && (has_integer_leading_zero(value) || value.parse::<i64>().is_err())
+}
+
+fn is_integer_like(value: &str) -> bool {
+    let digits = value
+        .strip_prefix(['+', '-'])
+        .filter(|digits| !digits.is_empty())
+        .unwrap_or(value);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn has_integer_leading_zero(value: &str) -> bool {
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    digits.len() > 1 && digits.starts_with('0')
+}
+
+fn non_finite_import_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "non-finite floating-point values cannot be imported",
+    )
 }
 
 fn sanitize_column_name(value: &str, index: usize) -> String {

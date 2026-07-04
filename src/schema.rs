@@ -279,7 +279,7 @@ impl AlteredTable {
 
     fn has_destructive_changes(&self) -> bool {
         !self.dropped_columns.is_empty()
-            || !self.dropped_indexes.is_empty()
+            || self.added_columns.iter().any(is_added_column_risky)
             || self
                 .altered_columns
                 .iter()
@@ -290,6 +290,10 @@ impl AlteredTable {
                 .is_some_and(|change| !change.from.is_empty() && change.from != change.to)
             || !self.dropped_constraints.is_empty()
     }
+}
+
+fn is_added_column_risky(column: &Column) -> bool {
+    !column.nullable && column.default.is_none()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -473,7 +477,7 @@ fn diff_table(old: &Table, new: &Table, rename_hints: &[RenameHint]) -> AlteredT
     for new_index in &new.indexes {
         match old.index(&new_index.name) {
             // Unchanged: nothing to do.
-            Some(existing) if existing == new_index => {}
+            Some(existing) if same_index_body(existing, new_index, rename_hints, old, new) => {}
             // Changed definition: drop and recreate.
             Some(_) => {
                 altered.dropped_indexes.push(new_index.name.clone());
@@ -498,7 +502,7 @@ fn diff_table(old: &Table, new: &Table, rename_hints: &[RenameHint]) -> AlteredT
                     from: old_name.to_string(),
                     to: new_index.name.clone(),
                 });
-                if old_index.columns != new_index.columns || old_index.unique != new_index.unique {
+                if !same_index_body(old_index, new_index, rename_hints, old, new) {
                     altered.dropped_indexes.push(new_index.name.clone());
                     altered.added_indexes.push(new_index.clone());
                 }
@@ -515,6 +519,8 @@ fn diff_table(old: &Table, new: &Table, rename_hints: &[RenameHint]) -> AlteredT
     for new_constraint in &new.constraints {
         match old.constraint(new_constraint.name()) {
             Some(existing) if existing == new_constraint => {}
+            Some(existing)
+                if same_constraint_body(existing, new_constraint, rename_hints, old, new) => {}
             Some(existing) => {
                 altered.dropped_constraints.push(existing.clone());
                 altered.added_constraints.push(new_constraint.clone());
@@ -541,7 +547,7 @@ fn diff_table(old: &Table, new: &Table, rename_hints: &[RenameHint]) -> AlteredT
                     from: old_name.to_string(),
                     to: new_constraint.name().to_string(),
                 });
-                if !same_constraint_body(old_constraint, new_constraint) {
+                if !same_constraint_body(old_constraint, new_constraint, rename_hints, old, new) {
                     altered.dropped_constraints.push(new_constraint.clone());
                     altered.added_constraints.push(new_constraint.clone());
                 }
@@ -644,11 +650,39 @@ fn rename_to<'a>(
     })
 }
 
-fn same_constraint_body(old: &TableConstraint, new: &TableConstraint) -> bool {
+fn same_index_body(
+    old_index: &Index,
+    new_index: &Index,
+    rename_hints: &[RenameHint],
+    old: &Table,
+    new: &Table,
+) -> bool {
+    old_index.unique == new_index.unique
+        && same_columns_with_renames(
+            &old_index.columns,
+            &new_index.columns,
+            rename_hints,
+            old,
+            new,
+        )
+}
+
+fn same_constraint_body(
+    old: &TableConstraint,
+    new: &TableConstraint,
+    rename_hints: &[RenameHint],
+    old_table: &Table,
+    new_table: &Table,
+) -> bool {
     match (old, new) {
         (TableConstraint::ForeignKey(old), TableConstraint::ForeignKey(new)) => {
-            old.columns == new.columns
-                && old.referenced_table == new.referenced_table
+            same_columns_with_renames(
+                &old.columns,
+                &new.columns,
+                rename_hints,
+                old_table,
+                new_table,
+            ) && old.referenced_table == new.referenced_table
                 && old.referenced_columns == new.referenced_columns
                 && old.on_delete == new.on_delete
                 && old.on_update == new.on_update
@@ -656,9 +690,33 @@ fn same_constraint_body(old: &TableConstraint, new: &TableConstraint) -> bool {
         (TableConstraint::Check(old), TableConstraint::Check(new)) => {
             old.expression == new.expression
         }
-        (TableConstraint::Unique(old), TableConstraint::Unique(new)) => old.columns == new.columns,
+        (TableConstraint::Unique(old), TableConstraint::Unique(new)) => same_columns_with_renames(
+            &old.columns,
+            &new.columns,
+            rename_hints,
+            old_table,
+            new_table,
+        ),
         _ => false,
     }
+}
+
+fn same_columns_with_renames(
+    old_columns: &[String],
+    new_columns: &[String],
+    rename_hints: &[RenameHint],
+    old: &Table,
+    new: &Table,
+) -> bool {
+    old_columns.len() == new_columns.len()
+        && old_columns
+            .iter()
+            .map(|column| {
+                rename_to(rename_hints, RenameKind::Column, old, new, column)
+                    .unwrap_or(column)
+                    .to_string()
+            })
+            .eq(new_columns.iter().cloned())
 }
 
 fn diff_column(old: &Column, new: &Column) -> Vec<ColumnChange> {
@@ -997,7 +1055,7 @@ fn emit_altered_table(
                 "ALTER TABLE {quoted_table} ADD COLUMN {};",
                 column_definition(dialect, column)
             ),
-            destructive: false,
+            destructive: is_added_column_risky(column),
         });
     }
     for rename in &table.renamed_columns {
@@ -1092,7 +1150,7 @@ fn emit_altered_table(
         };
         out.push(MigrationStatement {
             sql,
-            destructive: true,
+            destructive: false,
         });
     }
     for rename in &table.renamed_indexes {
@@ -1242,11 +1300,7 @@ fn drop_primary_key_sql(
     }
 }
 
-fn add_primary_key_sql(
-    dialect: &dyn SqlDialect,
-    quoted_table: &str,
-    columns: &[String],
-) -> String {
+fn add_primary_key_sql(dialect: &dyn SqlDialect, quoted_table: &str, columns: &[String]) -> String {
     let columns = columns
         .iter()
         .map(|column| dialect.quote_identifier(column))
@@ -1505,6 +1559,203 @@ mod tests {
         assert!(mysql.contains("DROP INDEX `gone` ON `t`;"));
         assert!(mysql.contains("CREATE INDEX `changed` ON `t` (`c`, `d`);"));
         assert!(mysql.contains("CREATE UNIQUE INDEX `fresh` ON `t` (`e`);"));
+    }
+
+    #[test]
+    fn primary_key_changes_are_detected_and_labeled_destructive() {
+        let old = Schema::new(vec![Table::new("orders")
+            .with_columns(vec![
+                col("id", "integer").not_null(),
+                col("tenant_id", "integer").not_null(),
+            ])
+            .with_primary_key(vec!["id".into()])]);
+        let new = Schema::new(vec![Table::new("orders")
+            .with_columns(vec![
+                col("id", "integer").not_null(),
+                col("tenant_id", "integer").not_null(),
+            ])
+            .with_primary_key(vec!["tenant_id".into(), "id".into()])]);
+
+        let diff = diff_schemas(&old, &new);
+        let pk_change = diff.altered_tables[0].primary_key_change.as_ref().unwrap();
+        assert_eq!(pk_change.from, vec!["id".to_string()]);
+        assert_eq!(
+            pk_change.to,
+            vec!["tenant_id".to_string(), "id".to_string()]
+        );
+        assert!(diff.has_destructive_changes());
+
+        let script = diff.to_migration(&PostgresDialect, AlterColumnStyle::Standard);
+        assert_eq!(script.destructive_count(), 1);
+        assert!(script
+            .to_sql()
+            .contains("ALTER TABLE \"orders\" DROP CONSTRAINT \"orders_pkey\";"));
+        assert!(script
+            .to_sql()
+            .contains("ALTER TABLE \"orders\" ADD PRIMARY KEY (\"tenant_id\", \"id\");"));
+    }
+
+    #[test]
+    fn destructive_labels_track_tightening_without_overlabeling_additive_changes() {
+        let additive_old = Schema::new(vec![Table::new("t").with_columns(vec![
+            col("name", "varchar(100)").not_null(),
+            col("age", "integer").not_null(),
+            col("flag", "boolean"),
+        ])]);
+        let additive_new = Schema::new(vec![Table::new("t").with_columns(vec![
+            col("name", "varchar(200)"),
+            col("age", "bigint").not_null().with_default("0"),
+            col("flag", "boolean").with_default("false"),
+            col("created_at", "timestamp"),
+        ])]);
+        let additive = diff_schemas(&additive_old, &additive_new);
+        assert!(!additive.has_destructive_changes());
+        assert_eq!(
+            additive
+                .to_migration(&PostgresDialect, AlterColumnStyle::Standard)
+                .destructive_count(),
+            0
+        );
+
+        let narrowing_old = Schema::new(vec![
+            Table::new("t").with_columns(vec![col("name", "text"), col("age", "bigint")])
+        ]);
+        let narrowing_new = Schema::new(vec![Table::new("t").with_columns(vec![
+            col("name", "varchar(50)").not_null(),
+            col("age", "integer"),
+        ])]);
+        let narrowing = diff_schemas(&narrowing_old, &narrowing_new);
+        assert!(narrowing.has_destructive_changes());
+        let script = narrowing.to_migration(&PostgresDialect, AlterColumnStyle::Standard);
+        assert_eq!(script.destructive_count(), 3);
+    }
+
+    #[test]
+    fn standard_alter_style_fails_closed_for_mysql_dialect() {
+        let old = Schema::new(vec![Table::new("t").with_columns(vec![col("c", "integer")])]);
+        let new = Schema::new(vec![Table::new("t").with_columns(vec![col("c", "bigint")])]);
+        let diff = diff_schemas(&old, &new);
+
+        let script = diff.to_migration(&MySqlDialect, AlterColumnStyle::Standard);
+        assert!(script.statements.is_empty());
+        assert!(script.has_unsupported());
+        assert!(script.unsupported[0]
+            .reason
+            .contains("Standard alter-table rendering is not supported"));
+    }
+
+    #[test]
+    fn constraints_are_compared_and_rendered() {
+        let old = Schema::new(vec![Table::new("orders")
+            .with_columns(vec![col("id", "integer"), col("user_id", "integer")])
+            .with_constraints(vec![
+                TableConstraint::ForeignKey(ForeignKeyConstraint {
+                    name: "orders_user_fk".into(),
+                    columns: vec!["user_id".into()],
+                    referenced_table: "users".into(),
+                    referenced_columns: vec!["id".into()],
+                    on_delete: Some("CASCADE".into()),
+                    on_update: None,
+                }),
+                TableConstraint::Check(CheckConstraint {
+                    name: "orders_id_positive".into(),
+                    expression: "id > 0".into(),
+                }),
+            ])]);
+        let new = Schema::new(vec![Table::new("orders")
+            .with_columns(vec![
+                col("id", "integer"),
+                col("user_id", "integer"),
+                col("order_no", "text"),
+            ])
+            .with_constraints(vec![
+                TableConstraint::Check(CheckConstraint {
+                    name: "orders_id_positive".into(),
+                    expression: "id >= 0".into(),
+                }),
+                TableConstraint::Unique(UniqueConstraint {
+                    name: "orders_order_no_unique".into(),
+                    columns: vec!["order_no".into()],
+                }),
+            ])]);
+
+        let diff = diff_schemas(&old, &new);
+        let altered = &diff.altered_tables[0];
+        assert_eq!(altered.dropped_constraints.len(), 2);
+        assert_eq!(altered.added_constraints.len(), 2);
+        assert!(diff.has_destructive_changes());
+
+        let sql = diff
+            .to_migration(&PostgresDialect, AlterColumnStyle::Standard)
+            .to_sql();
+        assert!(sql.contains("ALTER TABLE \"orders\" DROP CONSTRAINT \"orders_user_fk\";"));
+        assert!(sql.contains("ALTER TABLE \"orders\" DROP CONSTRAINT \"orders_id_positive\";"));
+        assert!(sql.contains(
+            "ALTER TABLE \"orders\" ADD CONSTRAINT \"orders_order_no_unique\" UNIQUE (\"order_no\");"
+        ));
+    }
+
+    #[test]
+    fn rename_hints_prevent_false_drop_add_diffs() {
+        let old = Schema::new(vec![Table::new("users")
+            .with_columns(vec![col("id", "integer"), col("email", "text")])
+            .with_indexes(vec![Index {
+                name: "users_email_idx".into(),
+                columns: vec!["email".into()],
+                unique: true,
+            }])
+            .with_constraints(vec![TableConstraint::Unique(UniqueConstraint {
+                name: "users_email_unique".into(),
+                columns: vec!["email".into()],
+            })])]);
+        let new = Schema::new(vec![Table::new("accounts")
+            .with_columns(vec![col("id", "integer"), col("email_address", "text")])
+            .with_indexes(vec![Index {
+                name: "accounts_email_idx".into(),
+                columns: vec!["email_address".into()],
+                unique: true,
+            }])
+            .with_constraints(vec![TableConstraint::Unique(UniqueConstraint {
+                name: "accounts_email_unique".into(),
+                columns: vec!["email_address".into()],
+            })])])
+        .with_rename_hints(vec![
+            RenameHint::Table {
+                from: "users".into(),
+                to: "accounts".into(),
+            },
+            RenameHint::Column {
+                table: "accounts".into(),
+                from: "email".into(),
+                to: "email_address".into(),
+            },
+            RenameHint::Index {
+                table: "accounts".into(),
+                from: "users_email_idx".into(),
+                to: "accounts_email_idx".into(),
+            },
+            RenameHint::Constraint {
+                table: "accounts".into(),
+                from: "users_email_unique".into(),
+                to: "accounts_email_unique".into(),
+            },
+        ]);
+
+        let diff = diff_schemas(&old, &new);
+        assert!(diff.added_tables.is_empty());
+        assert!(diff.dropped_tables.is_empty());
+        let altered = &diff.altered_tables[0];
+        assert_eq!(altered.renamed_from.as_deref(), Some("users"));
+        assert_eq!(altered.renamed_columns.len(), 1);
+        assert_eq!(altered.renamed_indexes.len(), 1);
+        assert_eq!(altered.renamed_constraints.len(), 1);
+        assert!(altered.added_columns.is_empty());
+        assert!(altered.dropped_columns.is_empty());
+        assert!(altered.added_indexes.is_empty());
+        assert!(altered.dropped_indexes.is_empty());
+        assert!(altered.added_constraints.is_empty());
+        assert!(altered.dropped_constraints.is_empty());
+        assert!(!diff.has_destructive_changes());
     }
 
     #[test]

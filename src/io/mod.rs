@@ -1015,6 +1015,7 @@ fn validate_row_width(actual: usize, expected: usize) -> io::Result<()> {
     }
 }
 
+#[cfg(any(feature = "avro", feature = "parquet"))]
 fn validate_finite_cells(row: &[Cell<'_>]) -> io::Result<()> {
     if row
         .iter()
@@ -1048,7 +1049,9 @@ pub(super) fn sql_string_literal(value: &str, backslash_escapes: bool) -> String
 }
 
 pub(super) fn dialect_uses_backslash_escapes(dialect: &dyn crate::dialect::SqlDialect) -> bool {
-    dialect.quote_identifier("__irodori_probe__").starts_with('`')
+    dialect
+        .quote_identifier("__irodori_probe__")
+        .starts_with('`')
 }
 
 fn validate_options(options: &DelimitedOptions) -> io::Result<()> {
@@ -1070,6 +1073,12 @@ fn validate_options(options: &DelimitedOptions) -> io::Result<()> {
             "quote cannot be a line break",
         ));
     }
+    if !matches!(options.line_ending.as_str(), "\n" | "\r\n") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "line ending must be either LF or CRLF",
+        ));
+    }
     Ok(())
 }
 
@@ -1088,8 +1097,10 @@ fn guard_delimited_formula(field: &str, enabled: bool) -> Cow<'_, str> {
 }
 
 fn starts_like_spreadsheet_formula(field: &str) -> bool {
-    matches!(field.as_bytes().first(), Some(b'=') | Some(b'+') | Some(b'-') | Some(b'@'))
-        || field.starts_with('\t')
+    matches!(
+        field.as_bytes().first(),
+        Some(b'=') | Some(b'+') | Some(b'-') | Some(b'@')
+    ) || field.starts_with('\t')
         || field.starts_with('\r')
 }
 
@@ -1177,6 +1188,72 @@ mod tests {
     }
 
     #[test]
+    fn delimited_options_reject_invalid_line_endings() {
+        let mut out = Vec::new();
+        let mut options = DelimitedOptions::csv();
+        options.line_ending.clear();
+
+        let err = match DelimitedEncoder::new(&mut out, &["value"], options) {
+            Ok(_) => panic!("invalid line ending should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn delimited_output_guards_text_formula_cells() {
+        let mut out = Vec::new();
+        let mut encoder =
+            DelimitedEncoder::csv(&mut out, &["=name", "amount", "@note"]).expect("encoder");
+
+        encoder
+            .write_row(&[Cell::Text("=2+3"), Cell::Integer(-7), Cell::Text("@cmd")])
+            .expect("row");
+        encoder.finish().expect("finish");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "'=name,amount,'@note\n'=2+3,-7,'@cmd\n"
+        );
+    }
+
+    #[test]
+    fn encoders_reject_non_finite_floats_and_wrong_row_width() {
+        let mut out = Vec::new();
+        let mut csv = DelimitedEncoder::csv(&mut out, &["value"]).expect("encoder");
+        assert_eq!(
+            csv.write_row(&[Cell::Float(f64::NAN)]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            csv.write_row(&[Cell::Integer(1), Cell::Integer(2)])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let mut out = Vec::new();
+        let mut json = JsonEncoder::new(&mut out, &["value"]).expect("encoder");
+        assert_eq!(
+            json.write_row(&[Cell::Float(f64::INFINITY)])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let mut out = Vec::new();
+        let mut ndjson = NdjsonEncoder::new(&mut out, &["value"]);
+        assert_eq!(
+            ndjson
+                .write_row(&[Cell::Float(f64::NEG_INFINITY)])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn sql_insert_writes_statements() {
         let mut out = Vec::new();
         let dialect = crate::dialect::PostgresDialect;
@@ -1190,6 +1267,23 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "INSERT INTO \"users\" (\"id\", \"name\") VALUES (42, 'Ann''s Studio');\n"
+        );
+    }
+
+    #[test]
+    fn sql_insert_escapes_mysql_backslash_sensitive_literals() {
+        let mut out = Vec::new();
+        let dialect = crate::dialect::MySqlDialect;
+        let mut encoder = SqlInsertEncoder::new(&mut out, "files", &["path"], &dialect);
+
+        encoder
+            .write_row(&[Cell::Text(r"C:\tmp\Ann's")])
+            .expect("row");
+        encoder.finish().expect("finish");
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "INSERT INTO `files` (`path`) VALUES ('C:\\\\tmp\\\\Ann''s');\n"
         );
     }
 
@@ -1255,6 +1349,28 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "INSERT INTO `users` (`id`, `name`) VALUES (1, 'A') ON DUPLICATE KEY UPDATE `name` = VALUES(`name`);\n"
+        );
+    }
+
+    #[test]
+    fn sql_script_rejects_non_finite_floats() {
+        let mut out = Vec::new();
+        let dialect = crate::dialect::PostgresDialect;
+        let mut encoder = SqlScriptEncoder::new(
+            &mut out,
+            "metrics",
+            &["value"],
+            &dialect,
+            Default::default(),
+        )
+        .expect("encoder");
+
+        assert_eq!(
+            encoder
+                .write_row(&[Cell::Float(f64::INFINITY)])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
         );
     }
 
@@ -1336,6 +1452,34 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
     }
 
     #[test]
+    fn ndjson_preview_tracks_late_columns_without_buffering_rows() {
+        let preview = preview_ndjson(
+            "{\"id\":1}\n{\"late\":2}\n",
+            ImportPreviewOptions { max_rows: 1 },
+        )
+        .expect("preview");
+
+        assert_eq!(preview.rows.len(), 1);
+        assert_eq!(preview.total_rows_seen, 2);
+        assert!(preview.truncated);
+        assert_eq!(
+            preview
+                .columns
+                .iter()
+                .map(|column| (&column.source_name, column.inferred_type))
+                .collect::<Vec<_>>(),
+            vec![
+                (&"id".to_string(), InferredType::Integer),
+                (&"late".to_string(), InferredType::Integer)
+            ]
+        );
+        assert_eq!(
+            preview.rows[0],
+            vec![OwnedCell::Integer(1), OwnedCell::Null]
+        );
+    }
+
+    #[test]
     fn delimited_preview_handles_csv_mapping_quotes_and_types() {
         let preview = preview_delimited(
             "User ID,Display Name,Notes\n1,Alice,\"hello, world\"\n2,Bob,\"line\nbreak\"\n"
@@ -1380,6 +1524,55 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
                 OwnedCell::Text("Bob".into()),
                 OwnedCell::Text("line\nbreak".into())
             ]
+        );
+    }
+
+    #[test]
+    fn delimited_preview_preserves_bom_leading_zeroes_and_large_integers() {
+        let csv_data = "\u{feff}zip,big,ratio\n00123,9223372036854775808,1.5\n";
+        let preview =
+            preview_delimited(csv_data.as_bytes(), DelimitedImportOptions::csv()).expect("preview");
+
+        assert_eq!(preview.columns[0].source_name, "zip");
+        assert_eq!(
+            preview
+                .columns
+                .iter()
+                .map(|column| column.inferred_type)
+                .collect::<Vec<_>>(),
+            vec![InferredType::Text, InferredType::Text, InferredType::Float]
+        );
+        assert_eq!(
+            preview.rows[0],
+            vec![
+                OwnedCell::Text("00123".into()),
+                OwnedCell::Text("9223372036854775808".into()),
+                OwnedCell::Float(1.5)
+            ]
+        );
+
+        let cols = infer_csv_schema(csv_data.as_bytes(), b',', true).expect("schema");
+        assert_eq!(cols[0].name, "zip");
+        assert_eq!(cols[0].data_type, "text");
+        assert_eq!(cols[1].data_type, "text");
+        assert_eq!(cols[2].data_type, "double");
+    }
+
+    #[test]
+    fn import_rejects_non_finite_float_tokens() {
+        let csv_data = "value\nNaN\n";
+
+        assert_eq!(
+            preview_delimited(csv_data.as_bytes(), DelimitedImportOptions::csv())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            infer_csv_schema(csv_data.as_bytes(), b',', true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
         );
     }
 
@@ -1449,6 +1642,19 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
     }
 
     #[test]
+    #[cfg(feature = "parquet")]
+    fn parquet_rejects_after_bounded_buffer_limit() {
+        let mut out = Vec::new();
+        let mut encoder = ParquetEncoder::new(&mut out, &["value"]);
+        encoder.buffered_rows =
+            vec![vec![OwnedCell::Integer(1)]; ParquetEncoder::<&mut Vec<u8>>::MAX_BUFFERED_ROWS];
+
+        let err = encoder.write_row(&[Cell::Integer(2)]).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn test_csv_inference_and_generation() {
         let csv_data = "id,name,active\n1,Alice,true\n2,Bob,false\n3,Charlie,true\n";
         let cols = infer_csv_schema(csv_data.as_bytes(), b',', true).unwrap();
@@ -1474,5 +1680,27 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
         assert_eq!(count, 3);
         let sql_str = String::from_utf8(sql_out).unwrap();
         assert!(sql_str.contains("INSERT INTO \"users\""));
+    }
+
+    #[test]
+    fn csv_insert_generation_preserves_textual_numbers_and_mysql_backslashes() {
+        let csv_data = "zip,big,path\n00123,9223372036854775808,C:\\tmp\\Ann's\n";
+        let mut sql_out = Vec::new();
+        let dialect = crate::dialect::MySqlDialect;
+        let count = generate_inserts_from_csv(
+            csv_data.as_bytes(),
+            b',',
+            true,
+            "users",
+            &mut sql_out,
+            &dialect,
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            String::from_utf8(sql_out).unwrap(),
+            "INSERT INTO `users` (`zip`, `big`, `path`) VALUES ('00123', '9223372036854775808', 'C:\\\\tmp\\\\Ann''s');\n"
+        );
     }
 }

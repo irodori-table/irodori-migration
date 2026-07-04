@@ -1,4 +1,3 @@
-use crate::dialect::{MySqlDialect, OracleDialect, PostgresDialect, SnowflakeDialect, SqlDialect};
 use crate::plan::MigrationEngine;
 
 pub(crate) fn table_ref(engine: MigrationEngine, name: &str) -> String {
@@ -14,7 +13,7 @@ pub(crate) fn column_ref(engine: MigrationEngine, name: &str) -> String {
 }
 
 pub(crate) fn identifier_ref(engine: MigrationEngine, value: &str) -> String {
-    dialect_for_engine(engine).quote_identifier_if_needed(value.trim())
+    engine.dialect().quote_identifier_if_needed(value.trim())
 }
 
 fn qualified_ref(engine: MigrationEngine, value: &str) -> String {
@@ -23,21 +22,4 @@ fn qualified_ref(engine: MigrationEngine, value: &str) -> String {
         .map(|part| identifier_ref(engine, part))
         .collect::<Vec<_>>()
         .join(".")
-}
-
-fn dialect_for_engine(engine: MigrationEngine) -> &'static dyn SqlDialect {
-    match engine {
-        MigrationEngine::MySql
-        | MigrationEngine::MariaDb
-        | MigrationEngine::Hive
-        | MigrationEngine::Databricks => &MySqlDialect,
-        MigrationEngine::Oracle => &OracleDialect,
-        MigrationEngine::Snowflake => &SnowflakeDialect,
-        MigrationEngine::Postgres
-        | MigrationEngine::DuckDb
-        | MigrationEngine::Iceberg
-        | MigrationEngine::S3Tables
-        | MigrationEngine::Redshift
-        | MigrationEngine::TrinoPresto => &PostgresDialect,
-    }
 }

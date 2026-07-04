@@ -1,5 +1,6 @@
 ---
 source: tests/migration_snapshots.rs
+assertion_line: 34
 expression: plan.target_sql
 ---
 -- Load the exported files with the target engine's bulk loader.
@@ -21,6 +22,54 @@ CREATE OR REPLACE TEMP TABLE irodori_target_manifest (
   irodori_row_hash VARCHAR(4000),
   irodori_partition VARCHAR(4000)
 );
+
+-- Stores generated chunk boundaries so validation can resume without re-walking the source table.
+CREATE TABLE IF NOT EXISTS irodori_migration_chunks (
+  migration_id VARCHAR(4000) NOT NULL,
+  table_name VARCHAR(4000) NOT NULL,
+  chunk_id VARCHAR(4000) NOT NULL,
+  lower_boundary VARCHAR(4000),
+  upper_boundary VARCHAR(4000),
+  key_count BIGINT,
+  created_at TIMESTAMP
+);
+
+-- Checkpoint table for resumable chunk validation and backfill workers.
+CREATE TABLE IF NOT EXISTS irodori_migration_checkpoints (
+  migration_id VARCHAR(4000) NOT NULL,
+  table_name VARCHAR(4000) NOT NULL,
+  chunk_id VARCHAR(4000) NOT NULL,
+  status VARCHAR(4000) NOT NULL,
+  row_count BIGINT,
+  checksum VARCHAR(4000),
+  error_message VARCHAR(4000),
+  updated_at TIMESTAMP
+);
+
+-- Resume cursor: pick the first chunk that has not reached a completed checkpoint.
+SELECT
+  c.chunk_id,
+  c.lower_boundary,
+  c.upper_boundary
+FROM irodori_migration_chunks c
+LEFT JOIN irodori_migration_checkpoints p
+  ON p.migration_id = '${IRODORI_MIGRATION_ID}'
+  AND p.table_name = 'warehouse.orders'
+  AND p.chunk_id = c.chunk_id
+  AND p.status = 'completed'
+WHERE c.migration_id = '${IRODORI_MIGRATION_ID}'
+  AND c.table_name = 'warehouse.orders'
+  AND p.chunk_id IS NULL
+ORDER BY c.chunk_id
+LIMIT 1;
+
+-- Mark a chunk completed after source/target counts and checksum/hash gates pass.
+DELETE FROM irodori_migration_checkpoints
+WHERE migration_id = '${IRODORI_MIGRATION_ID}'
+  AND table_name = 'warehouse.orders'
+  AND chunk_id = '${IRODORI_CHUNK_ID}';
+INSERT INTO irodori_migration_checkpoints (migration_id, table_name, chunk_id, status, row_count, checksum, updated_at)
+VALUES ('${IRODORI_MIGRATION_ID}', 'warehouse.orders', '${IRODORI_CHUNK_ID}', 'completed', ${IRODORI_ROW_COUNT}, '${IRODORI_CHECKSUM}', CURRENT_TIMESTAMP);
 
 -- Fast MD5 validation fingerprint. Use this before running row-level diff.
 WITH row_hashes AS (

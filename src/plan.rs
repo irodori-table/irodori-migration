@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::canonical::{canonical_row_from_values_sql, CanonicalizationPolicy};
+use crate::dialect::{MySqlDialect, OracleDialect, PostgresDialect, SnowflakeDialect, SqlDialect};
 use crate::sql_ref::{column_ref, identifier_ref, table_ref};
 
 const ROW_HASH_ALGORITHM_LABEL: &str = "MD5";
@@ -48,6 +49,20 @@ impl MigrationEngine {
 
     pub fn is_duckdb_lakehouse(self) -> bool {
         matches!(self, Self::Iceberg | Self::S3Tables)
+    }
+
+    pub fn dialect(self) -> &'static dyn SqlDialect {
+        match self {
+            Self::MySql | Self::MariaDb | Self::Hive | Self::Databricks => &MySqlDialect,
+            Self::Oracle => &OracleDialect,
+            Self::Snowflake => &SnowflakeDialect,
+            Self::Postgres
+            | Self::DuckDb
+            | Self::Iceberg
+            | Self::S3Tables
+            | Self::Redshift
+            | Self::TrinoPresto => &PostgresDialect,
+        }
     }
 }
 
@@ -860,7 +875,17 @@ pub fn map_column_type(
     let normalized = normalize_type_name(trimmed);
     let mut warnings = Vec::new();
     let mut lossy = false;
-    let target_type = if normalized.contains("json")
+    let target_type = if normalized.starts_with("map")
+        || normalized.starts_with("array")
+        || normalized.starts_with("struct")
+    {
+        lossy = true;
+        warnings.push(
+            "Nested collection type maps to a semi-structured target type and needs shape validation."
+                .to_string(),
+        );
+        json_ddl_type(target_engine)
+    } else if normalized.contains("json")
         || normalized.contains("variant")
         || normalized.contains("object")
     {
@@ -906,6 +931,12 @@ pub fn map_column_type(
         }
         decimal_ddl_type(target_engine, trimmed)
     } else if normalized.contains("bigint") || normalized.contains("long") {
+        if normalized.contains("unsigned") {
+            lossy = true;
+            warnings.push(
+                "Unsigned integer range needs explicit target bounds validation.".to_string(),
+            );
+        }
         integer_ddl_type(target_engine, true)
     } else if normalized.contains("int") {
         if normalized.contains("unsigned") {
@@ -1078,7 +1109,16 @@ fn row_hash_digest_expression(engine: MigrationEngine, canonical_row: &str) -> S
         MigrationEngine::TrinoPresto => {
             format!("LOWER(TO_HEX(MD5(TO_UTF8({canonical_row}))))")
         }
-        _ => format!("LOWER(MD5({canonical_row}))"),
+        MigrationEngine::Postgres
+        | MigrationEngine::MySql
+        | MigrationEngine::MariaDb
+        | MigrationEngine::Snowflake
+        | MigrationEngine::Hive
+        | MigrationEngine::DuckDb
+        | MigrationEngine::Iceberg
+        | MigrationEngine::S3Tables
+        | MigrationEngine::Redshift
+        | MigrationEngine::Databricks => format!("LOWER(MD5({canonical_row}))"),
     }
 }
 
@@ -2686,6 +2726,8 @@ mod tests {
     fn builds_hive_to_snowflake_plan() {
         let plan = build_migration_plan(&MigrationSpec::default());
 
+        assert!(plan.source_sql.contains("Chunk iterator"));
+        assert!(plan.source_sql.contains("batch_size=5000000"));
         assert!(plan
             .source_sql
             .contains("INSERT OVERWRITE DIRECTORY '${EXPORT_PATH}'"));
@@ -2696,6 +2738,8 @@ mod tests {
         assert!(plan.source_sql.contains("irodori_key_hash"));
         assert!(plan.source_sql.contains("Partition fingerprint"));
         assert!(plan.target_sql.contains("COPY INTO analytics.orders"));
+        assert!(plan.target_sql.contains("irodori_migration_checkpoints"));
+        assert!(plan.target_sql.contains("Resume cursor"));
         assert!(plan.diff_sql.contains("Bucket-level diff"));
         assert!(plan.diff_sql.contains("${IRODORI_HASH_BUCKET}"));
         assert!(plan
@@ -2819,6 +2863,139 @@ mod tests {
         assert!(failed_bucket.body.contains("${2:partition_value}"));
         assert_eq!(failed_bucket.variables.len(), 2);
         assert_eq!(failed_bucket.variables[0].name, "IRODORI_HASH_BUCKET");
+    }
+
+    #[test]
+    fn chunk_iterator_walks_stable_key_batches() {
+        let sql = chunk_iteration_sql(
+            MigrationEngine::Postgres,
+            &ChunkIterationConfig::new("public.orders", vec!["order_id".to_string()])
+                .with_predicate("sales_dt >= DATE '2026-01-01'")
+                .with_batch_size(2_500),
+        );
+
+        assert!(sql.contains("ROW_NUMBER() OVER (ORDER BY order_id)"));
+        assert!(sql.contains("FLOOR((irodori_row_number - 1) / 2500)"));
+        assert!(sql.contains("MIN(order_id) AS lower_boundary"));
+        assert!(sql.contains("sales_dt >= DATE '2026-01-01'"));
+    }
+
+    #[test]
+    fn checkpoint_sql_supports_resume_and_completion() {
+        let config = MigrationCheckpointConfig::new("orders-20260704", "public.orders");
+
+        let ddl = checkpoint_table_sql(MigrationEngine::Postgres, &config.checkpoint_table);
+        let resume = checkpoint_resume_sql(MigrationEngine::Postgres, &config);
+        let completed = checkpoint_mark_completed_sql(MigrationEngine::Postgres, &config);
+
+        assert!(ddl.contains("status TEXT NOT NULL"));
+        assert!(resume.contains("p.status = 'completed'"));
+        assert!(resume.contains("LIMIT 1"));
+        assert!(completed.contains("DELETE FROM irodori_migration_checkpoints"));
+        assert!(completed.contains("${IRODORI_CHECKSUM}"));
+    }
+
+    #[test]
+    fn foreign_key_order_loads_parents_before_children_and_defers_cycles() {
+        let tables = vec![
+            "orders".to_string(),
+            "customers".to_string(),
+            "order_lines".to_string(),
+            "employees".to_string(),
+        ];
+        let fks = vec![
+            ForeignKeySpec {
+                name: "orders_customer_fk".to_string(),
+                child_table: "orders".to_string(),
+                parent_table: "customers".to_string(),
+                child_columns: vec!["customer_id".to_string()],
+                parent_columns: vec!["id".to_string()],
+            },
+            ForeignKeySpec {
+                name: "lines_order_fk".to_string(),
+                child_table: "order_lines".to_string(),
+                parent_table: "orders".to_string(),
+                child_columns: vec!["order_id".to_string()],
+                parent_columns: vec!["id".to_string()],
+            },
+            ForeignKeySpec {
+                name: "employees_manager_fk".to_string(),
+                child_table: "employees".to_string(),
+                parent_table: "employees".to_string(),
+                child_columns: vec!["manager_id".to_string()],
+                parent_columns: vec!["id".to_string()],
+            },
+        ];
+
+        let order = foreign_key_load_order(&tables, &fks);
+
+        let customers = order
+            .ordered_tables
+            .iter()
+            .position(|table| table == "customers")
+            .expect("customers");
+        let orders = order
+            .ordered_tables
+            .iter()
+            .position(|table| table == "orders")
+            .expect("orders");
+        let lines = order
+            .ordered_tables
+            .iter()
+            .position(|table| table == "order_lines")
+            .expect("order_lines");
+        assert!(customers < orders);
+        assert!(orders < lines);
+        assert!(order
+            .deferred_foreign_keys
+            .iter()
+            .any(|fk| fk.name == "employees_manager_fk"));
+    }
+
+    #[test]
+    fn target_ddl_maps_source_types_to_target_engine() {
+        let columns = vec![
+            SourceColumnSpec::new("id", "NUMBER(18,0)").not_null(),
+            SourceColumnSpec::new("payload", "CLOB"),
+            SourceColumnSpec::new("attributes", "JSON"),
+            SourceColumnSpec::new("created_at", "TIMESTAMP WITH TIME ZONE").not_null(),
+        ];
+
+        let ddl = target_table_ddl_sql(
+            MigrationEngine::Oracle,
+            MigrationEngine::Postgres,
+            "public.orders",
+            &columns,
+        );
+
+        assert!(ddl.contains("CREATE TABLE public.orders"));
+        assert!(ddl.contains("id DECIMAL(18,0) NOT NULL"));
+        assert!(ddl.contains("payload TEXT"));
+        assert!(ddl.contains("attributes JSONB"));
+        assert!(ddl.contains("created_at TIMESTAMP NOT NULL"));
+        assert!(ddl.contains("Timestamp timezone/session semantics"));
+    }
+
+    #[test]
+    fn type_mapping_flags_lossy_unsigned_and_unknown_types() {
+        let unsigned = map_column_type(
+            MigrationEngine::MySql,
+            MigrationEngine::Postgres,
+            "BIGINT UNSIGNED",
+        );
+        let unknown = map_column_type(
+            MigrationEngine::Hive,
+            MigrationEngine::Snowflake,
+            "MAP<STRING,STRING>",
+        );
+
+        assert!(unsigned.lossy);
+        assert!(unsigned
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Unsigned integer range")));
+        assert_eq!(unknown.target_type, "VARIANT");
+        assert!(unknown.lossy);
     }
 
     #[test]

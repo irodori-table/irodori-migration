@@ -2,6 +2,27 @@
 
 All notable changes to `irodori-migration` are documented here.
 
+## 0.3.0 - 2026-07-04
+
+- Fixed cross-engine checksum generation to avoid MySQL-only SQL on unsupported
+  engines and to keep Postgres/MySQL MD5 integer semantics aligned.
+- Hardened canonical SQL for Postgres floats, boolean NULL handling, unsafe UTC
+  timestamp normalization, and unsupported engine paths.
+- Extended schema diffs with primary-key changes, FK/CHECK/UNIQUE constraints,
+  rename hints, unsupported DDL entries, and sharper destructive-change labels.
+- Hardened IO/import/export paths for MySQL backslash escaping, non-finite
+  floats, row-width validation, UTF-8 BOM headers, oversized integers, leading
+  zeroes, and spreadsheet-formula-looking delimited text.
+- Added real chunk-iteration SQL to generated migration plans and refreshed SQL
+  snapshots.
+- Added resumable migration checkpoint SQL, FK-aware load ordering,
+  cross-engine target DDL/type mapping helpers, and rollout gates backed by
+  checksum/diff validation summaries.
+- Added a shared `MigrationEngine::dialect()` bridge so generated SQL quoting
+  uses one engine-to-dialect mapping.
+- Expanded tests for checksum/canonical fail-closed behavior, schema DDL
+  rendering, and IO edge cases.
+
 ## 0.2.0 - 2026-06-30
 
 - Added tracing instrumentation for export and migration plan generation paths.

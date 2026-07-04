@@ -1,7 +1,38 @@
 ---
 source: tests/migration_snapshots.rs
+assertion_line: 33
 expression: plan.source_sql
 ---
+-- Chunk iterator. Feed each chunk_id/lower/upper into checksum and load workers; batch_size=5000000.
+WITH ordered_keys AS (
+  SELECT
+    order_id AS order_id,
+    line_id AS line_id
+  FROM public.orders
+WHERE sales_dt >= '2026-01-01'
+  GROUP BY order_id, line_id
+),
+numbered_keys AS (
+  SELECT
+    order_id, line_id,
+    ROW_NUMBER() OVER (ORDER BY order_id, line_id) AS irodori_row_number
+  FROM ordered_keys
+),
+chunked_keys AS (
+  SELECT
+    order_id, line_id,
+    FLOOR((irodori_row_number - 1) / 5000000) AS irodori_chunk_ordinal
+  FROM numbered_keys
+)
+SELECT
+  irodori_chunk_ordinal AS chunk_id,
+  MIN(order_id) AS lower_boundary,
+  MAX(order_id) AS upper_boundary,
+  COUNT(*) AS key_count
+FROM chunked_keys
+GROUP BY irodori_chunk_ordinal
+ORDER BY irodori_chunk_ordinal;
+
 -- Row hash manifest query using MD5 over Irodori canonical row strings.
 SELECT
   order_id,
