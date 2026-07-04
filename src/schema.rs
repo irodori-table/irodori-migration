@@ -280,6 +280,7 @@ impl AlteredTable {
     fn has_destructive_changes(&self) -> bool {
         !self.dropped_columns.is_empty()
             || self.added_columns.iter().any(is_added_column_risky)
+            || !self.dropped_indexes.is_empty()
             || self
                 .altered_columns
                 .iter()
@@ -1150,7 +1151,7 @@ fn emit_altered_table(
         };
         out.push(MigrationStatement {
             sql,
-            destructive: false,
+            destructive: true,
         });
     }
     for rename in &table.renamed_indexes {
@@ -1552,6 +1553,7 @@ mod tests {
         assert!(altered.dropped_indexes.contains(&"gone".to_string()));
         assert!(altered.dropped_indexes.contains(&"changed".to_string()));
         assert_eq!(altered.added_indexes.len(), 2); // changed + fresh
+        assert!(diff.has_destructive_changes());
 
         let mysql = diff
             .to_migration(&MySqlDialect, AlterColumnStyle::MySql)
@@ -1559,6 +1561,8 @@ mod tests {
         assert!(mysql.contains("DROP INDEX `gone` ON `t`;"));
         assert!(mysql.contains("CREATE INDEX `changed` ON `t` (`c`, `d`);"));
         assert!(mysql.contains("CREATE UNIQUE INDEX `fresh` ON `t` (`e`);"));
+        let script = diff.to_migration(&MySqlDialect, AlterColumnStyle::MySql);
+        assert_eq!(script.destructive_count(), 2);
     }
 
     #[test]

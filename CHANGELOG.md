@@ -2,6 +2,11 @@
 
 All notable changes to `irodori-migration` are documented here.
 
+## 0.4.1 - 2026-07-04
+
+- Marked dropped indexes as destructive changes in schema diffs and generated
+  migration statements.
+
 ## 0.4.0 - 2026-07-04
 
 - Added `TableRef` and shared table-reference rendering for catalog/schema/table
