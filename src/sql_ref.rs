@@ -1,6 +1,4 @@
-use crate::dialect::{
-    MySqlDialect, OracleDialect, PostgresDialect, SnowflakeDialect, SqlDialect,
-};
+use crate::dialect::{MySqlDialect, OracleDialect, PostgresDialect, SnowflakeDialect, SqlDialect};
 use crate::plan::MigrationEngine;
 
 pub(crate) fn table_ref(engine: MigrationEngine, name: &str) -> String {
@@ -43,4 +41,3 @@ fn dialect_for_engine(engine: MigrationEngine) -> &'static dyn SqlDialect {
         | MigrationEngine::TrinoPresto => &PostgresDialect,
     }
 }
-

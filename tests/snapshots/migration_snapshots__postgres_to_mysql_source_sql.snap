@@ -2,57 +2,57 @@
 source: tests/migration_snapshots.rs
 expression: plan.source_sql
 ---
--- Row hash manifest query.
+-- Row hash manifest query using MD5 over Irodori canonical row strings.
 SELECT
   order_id,
   line_id,
   amount,
   status,
   sales_dt AS irodori_partition,
-  LOWER(MD5(CONCAT_WS('|#|', COALESCE(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__')))) AS irodori_key_hash,
-  LOWER(MD5(CONCAT_WS('|#|', COALESCE(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__')))) AS irodori_row_hash
+  LOWER(MD5(CONCAT(CASE WHEN REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'))) END))) AS irodori_key_hash,
+  LOWER(MD5(CONCAT(CASE WHEN REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g'))) END))) AS irodori_row_hash
 FROM public.orders
 WHERE sales_dt >= '2026-01-01';
 
--- Fast validation fingerprint. Use this before running row-level diff.
+-- Fast MD5 validation fingerprint. Use this before running row-level diff.
 WITH row_hashes AS (
-  -- Row hash manifest query.
+  -- Row hash manifest query using MD5 over Irodori canonical row strings.
   SELECT
     order_id,
     line_id,
     amount,
     status,
     sales_dt AS irodori_partition,
-    LOWER(MD5(CONCAT_WS('|#|', COALESCE(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__')))) AS irodori_key_hash,
-    LOWER(MD5(CONCAT_WS('|#|', COALESCE(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__')))) AS irodori_row_hash
+    LOWER(MD5(CONCAT(CASE WHEN REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'))) END))) AS irodori_key_hash,
+    LOWER(MD5(CONCAT(CASE WHEN REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g'))) END))) AS irodori_row_hash
   FROM public.orders
   WHERE sales_dt >= '2026-01-01'
 )
 SELECT
   COUNT(*) AS row_count,
-  COUNT(DISTINCT CONCAT_WS('|#|', COALESCE(CAST(order_id AS TEXT), '__IRODORI_NULL__'), COALESCE(CAST(line_id AS TEXT), '__IRODORI_NULL__'))) AS key_count,
+  COUNT(DISTINCT CONCAT(CASE WHEN CAST(order_id AS TEXT) IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(CAST(order_id AS TEXT)), ':', CAST(order_id AS TEXT))) END, '', CASE WHEN CAST(line_id AS TEXT) IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(CAST(line_id AS TEXT)), ':', CAST(line_id AS TEXT))) END)) AS key_count,
   MIN(irodori_row_hash) AS min_row_hash,
   MAX(irodori_row_hash) AS max_row_hash
 FROM row_hashes;
 
 -- Partition fingerprint. Run row-level diff only for failed partitions.
 WITH row_hashes AS (
-  -- Row hash manifest query.
+  -- Row hash manifest query using MD5 over Irodori canonical row strings.
   SELECT
     order_id,
     line_id,
     amount,
     status,
     sales_dt AS irodori_partition,
-    LOWER(MD5(CONCAT_WS('|#|', COALESCE(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__')))) AS irodori_key_hash,
-    LOWER(MD5(CONCAT_WS('|#|', COALESCE(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__'), COALESCE(REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g'), '__IRODORI_NULL__')))) AS irodori_row_hash
+    LOWER(MD5(CONCAT(CASE WHEN REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'))) END))) AS irodori_key_hash,
+    LOWER(MD5(CONCAT(CASE WHEN REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(line_id AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g'))) END, '|#|', CASE WHEN REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g') IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g')), ':', REGEXP_REPLACE(CAST(status AS TEXT), '\s+', ' ', 'g'))) END))) AS irodori_row_hash
   FROM public.orders
   WHERE sales_dt >= '2026-01-01'
 )
 SELECT
   irodori_partition AS irodori_partition,
   COUNT(*) AS row_count,
-  COUNT(DISTINCT CONCAT_WS('|#|', COALESCE(CAST(order_id AS TEXT), '__IRODORI_NULL__'), COALESCE(CAST(line_id AS TEXT), '__IRODORI_NULL__'))) AS key_count,
+  COUNT(DISTINCT CONCAT(CASE WHEN CAST(order_id AS TEXT) IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(CAST(order_id AS TEXT)), ':', CAST(order_id AS TEXT))) END, '', CASE WHEN CAST(line_id AS TEXT) IS NULL THEN '__IRODORI_NULL__' ELSE CONCAT('V', CONCAT(LENGTH(CAST(line_id AS TEXT)), ':', CAST(line_id AS TEXT))) END)) AS key_count,
   MIN(irodori_row_hash) AS min_row_hash,
   MAX(irodori_row_hash) AS max_row_hash
 FROM row_hashes

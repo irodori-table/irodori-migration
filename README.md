@@ -53,4 +53,7 @@ cargo clippy --all-features --all-targets -- -D warnings
 
 Live SQL smoke tests are ignored by default. See [docs/testing.md](docs/testing.md).
 
+Review backlog and known correctness gaps are tracked in
+[docs/known-issues.md](docs/known-issues.md).
+
 License: `MIT OR 0BSD`.

@@ -136,7 +136,11 @@ fn canonical_cell_from_value_sql(
 fn length_prefixed_cell_sql(engine: MigrationEngine, value: &str, null_token: &str) -> String {
     let payload = concat_raw_sql(
         engine,
-        &[length_sql(engine, value), sql_string(":"), value.to_string()],
+        &[
+            length_sql(engine, value),
+            sql_string(":"),
+            value.to_string(),
+        ],
     );
     format!(
         "CASE WHEN {value} IS NULL THEN {} ELSE {} END",

@@ -9,6 +9,9 @@ use std::collections::HashSet;
 use crate::canonical::{canonical_row_from_values_sql, CanonicalizationPolicy};
 use crate::sql_ref::{column_ref, identifier_ref, table_ref};
 
+const ROW_HASH_ALGORITHM_LABEL: &str = "MD5";
+const ROW_HASH_CONTRACT_WARNING: &str = "Row hashes must use MD5 over Irodori canonical row strings on both source and target manifests; mixing engine-native hash algorithms will report every row as changed.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MigrationEngine {
     Postgres,
@@ -46,7 +49,6 @@ impl MigrationEngine {
     pub fn is_duckdb_lakehouse(self) -> bool {
         matches!(self, Self::Iceberg | Self::S3Tables)
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,7 +501,9 @@ pub fn row_hash_select_sql(
         ));
     }
     let mut lines = vec![
-        "-- Row hash manifest query.".to_string(),
+        format!(
+            "-- Row hash manifest query using {ROW_HASH_ALGORITHM_LABEL} over Irodori canonical row strings."
+        ),
         "SELECT".to_string(),
         projected
             .into_iter()
@@ -526,14 +530,8 @@ pub fn row_hash_expression(
         .iter()
         .map(|column| normalized_column_text_value(engine, column, spec))
         .collect::<Vec<_>>();
-    let concatenated = canonical_row_from_values_sql(engine, &values, &canonical_policy(spec));
-    match engine {
-        MigrationEngine::Oracle => {
-            format!("LOWER(RAWTOHEX(STANDARD_HASH({concatenated}, 'MD5')))")
-        }
-        MigrationEngine::TrinoPresto => format!("LOWER(TO_HEX(MD5(TO_UTF8({concatenated}))))"),
-        _ => format!("LOWER(MD5({concatenated}))"),
-    }
+    let canonical_row = canonical_row_from_values_sql(engine, &values, &canonical_policy(spec));
+    row_hash_digest_expression(engine, &canonical_row)
 }
 
 pub fn key_hash_expression(
@@ -544,9 +542,21 @@ pub fn key_hash_expression(
     row_hash_expression(engine, key_columns, spec)
 }
 
+fn row_hash_digest_expression(engine: MigrationEngine, canonical_row: &str) -> String {
+    match engine {
+        MigrationEngine::Oracle => {
+            format!("LOWER(RAWTOHEX(STANDARD_HASH({canonical_row}, '{ROW_HASH_ALGORITHM_LABEL}')))")
+        }
+        MigrationEngine::TrinoPresto => {
+            format!("LOWER(TO_HEX(MD5(TO_UTF8({canonical_row}))))")
+        }
+        _ => format!("LOWER(MD5({canonical_row}))"),
+    }
+}
+
 pub fn fingerprint_sql(engine: MigrationEngine, row_hash_sql: &str, keys: &[String]) -> String {
     [
-        "-- Fast validation fingerprint. Use this before running row-level diff.".to_string(),
+        format!("-- Fast {ROW_HASH_ALGORITHM_LABEL} validation fingerprint. Use this before running row-level diff."),
         "WITH row_hashes AS (".to_string(),
         indent(row_hash_sql),
         ")".to_string(),
@@ -925,7 +935,9 @@ pub fn manifest_table_sql(
     }
 
     [
-        "-- Manifest tables hold source and target row hashes for fast diff.".to_string(),
+        format!(
+            "-- Manifest tables hold source and target {ROW_HASH_ALGORITHM_LABEL} row hashes for fast diff."
+        ),
         format!(
             "CREATE OR REPLACE TEMP TABLE {} (",
             table_ref(engine, "irodori_source_manifest")
@@ -1439,7 +1451,9 @@ fn hive_export_sql(spec: &MigrationSpec, keys: &[String], hash_columns: &[String
     };
 
     let mut lines = vec![
-        "-- Hive extraction: partitioned files plus deterministic row hashes.".to_string(),
+        format!(
+            "-- Hive extraction: partitioned files plus deterministic {ROW_HASH_ALGORITHM_LABEL} row hashes."
+        ),
         "SET hive.execution.engine=tez;".to_string(),
         "SET hive.vectorized.execution.enabled=true;".to_string(),
         "SET hive.exec.compress.output=true;".to_string(),
@@ -1617,6 +1631,7 @@ fn build_warnings(
     if compare_columns.is_empty() {
         warnings.push("Compare columns are empty, so only key columns will be hashed.".to_string());
     }
+    warnings.push(ROW_HASH_CONTRACT_WARNING.to_string());
     if spec.source_engine == MigrationEngine::Hive
         && spec.export_format != MigrationExportFormat::Parquet
     {
@@ -1652,7 +1667,7 @@ fn build_warnings(
 fn build_pair_notes(spec: &MigrationSpec) -> Vec<String> {
     let mut notes = vec![
         "Use an inventory scan before moving data: schema, row counts, partitions, primary keys, nullability, and incompatible types.".to_string(),
-        "Use recipe-style transforms for DDL and SQL rewrites, then gate every batch with count, hash, and sampled row checks.".to_string(),
+        format!("Use recipe-style transforms for DDL and SQL rewrites, then gate every batch with count, {ROW_HASH_ALGORITHM_LABEL} row hash, and sampled row checks."),
     ];
 
     if spec.source_engine == MigrationEngine::Hive
@@ -1993,6 +2008,10 @@ mod tests {
         assert!(plan.diff_sql.contains("Bucket-level diff"));
         assert!(plan.diff_sql.contains("${IRODORI_HASH_BUCKET}"));
         assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("MD5 over Irodori canonical row strings")));
+        assert!(plan
             .pair_notes
             .iter()
             .any(|note| note.contains("Hive -> Snowflake")));
@@ -2021,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn oracle_hash_uses_standard_hash() {
+    fn oracle_hash_uses_md5_standard_hash() {
         let spec = MigrationSpec {
             source_engine: MigrationEngine::Oracle,
             compare_columns: vec!["CUSTOMER ID".to_string(), "AMOUNT".to_string()],
@@ -2033,8 +2052,54 @@ mod tests {
         let sql = row_hash_expression(MigrationEngine::Oracle, &spec.compare_columns, &spec);
 
         assert!(sql.contains("STANDARD_HASH"));
+        assert!(sql.contains("'MD5'"));
+        assert!(!sql.contains("'SHA256'"));
         assert!(sql.contains("\"CUSTOMER ID\""));
         assert!(sql.contains(" || '|' || "));
+    }
+
+    #[test]
+    fn postgres_to_mysql_plan_uses_same_row_hash_algorithm() {
+        let spec = MigrationSpec {
+            source_engine: MigrationEngine::Postgres,
+            target_engine: MigrationEngine::MySql,
+            source_table: "public.orders".to_string(),
+            target_table: "orders".to_string(),
+            key_columns: vec!["id".to_string()],
+            compare_columns: vec!["id".to_string(), "amount".to_string()],
+            ..MigrationSpec::default()
+        };
+
+        let plan = build_migration_plan(&spec);
+
+        assert!(plan.source_sql.contains("LOWER(MD5("));
+        assert!(plan.target_sql.contains("LOWER(MD5("));
+        assert!(!plan.source_sql.contains("SHA2"));
+        assert!(!plan.target_sql.contains("SHA2"));
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("mixing engine-native hash algorithms")));
+    }
+
+    #[test]
+    fn postgres_mysql_row_hash_uses_same_digest_and_length_prefixes() {
+        let spec = MigrationSpec {
+            source_engine: MigrationEngine::Postgres,
+            target_engine: MigrationEngine::MySql,
+            compare_columns: vec!["order_id".to_string(), "payload".to_string()],
+            ..MigrationSpec::default()
+        };
+
+        let postgres = row_hash_expression(MigrationEngine::Postgres, &spec.compare_columns, &spec);
+        let mysql = row_hash_expression(MigrationEngine::MySql, &spec.compare_columns, &spec);
+
+        assert!(postgres.starts_with("LOWER(MD5("));
+        assert!(mysql.starts_with("LOWER(MD5("));
+        assert!(postgres.contains("'V'"));
+        assert!(mysql.contains("'V'"));
+        assert!(!postgres.contains("CONCAT_WS"));
+        assert!(!mysql.contains("SHA2"));
     }
 
     #[test]

@@ -774,14 +774,12 @@ fn avro_cell(cell: &OwnedCell) -> apache_avro::types::Value {
             1,
             Box::new(apache_avro::types::Value::Boolean(*value)),
         ),
-        OwnedCell::Integer(value) => apache_avro::types::Value::Union(
-            2,
-            Box::new(apache_avro::types::Value::Long(*value)),
-        ),
-        OwnedCell::Float(value) => apache_avro::types::Value::Union(
-            3,
-            Box::new(apache_avro::types::Value::Double(*value)),
-        ),
+        OwnedCell::Integer(value) => {
+            apache_avro::types::Value::Union(2, Box::new(apache_avro::types::Value::Long(*value)))
+        }
+        OwnedCell::Float(value) => {
+            apache_avro::types::Value::Union(3, Box::new(apache_avro::types::Value::Double(*value)))
+        }
         OwnedCell::Text(value) => apache_avro::types::Value::Union(
             4,
             Box::new(apache_avro::types::Value::String(value.to_string())),
@@ -1362,7 +1360,10 @@ INSERT INTO \"users\" (\"id\", \"name\") VALUES (3, NULL);\n"
     #[cfg(feature = "avro")]
     fn avro_rejects_invalid_field_names_without_panic() {
         let mut out = Vec::new();
-        let error = AvroEncoder::new(&mut out, &["bad-name"]).expect_err("invalid avro name");
+        let error = match AvroEncoder::new(&mut out, &["bad-name"]) {
+            Ok(_) => panic!("invalid avro name should return an error"),
+            Err(error) => error,
+        };
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
