@@ -1,3 +1,6 @@
+<!-- i18n: language-switcher -->
+[English](README.md) | [日本語](README.ja.md)
+
 # irodori-migration
 
 Execution-free migration planning and data-diff primitives for Rust apps.

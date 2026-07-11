@@ -1,3 +1,6 @@
+<!-- i18n: language-switcher -->
+[English](known-issues.md) | [日本語](known-issues.ja.md)
+
 # Known Issues And Review Backlog
 
 This file tracks the review findings that affect correctness, API shape,
