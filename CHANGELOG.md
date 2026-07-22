@@ -2,6 +2,13 @@
 
 All notable changes to `irodori-migration` are documented here.
 
+## 0.4.2 - 2026-07-23
+
+- Added RustSec dependency auditing to continuous integration and releases.
+- Added an automated, tag-validated GitHub release workflow with packaged crate
+  artifacts and optional crates.io publication.
+- Updated GitHub Actions and corrected stale license wording in the README.
+
 ## 0.4.1 - 2026-07-04
 
 - Marked dropped indexes as destructive changes in schema diffs and generated

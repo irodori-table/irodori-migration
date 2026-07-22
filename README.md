@@ -60,8 +60,6 @@ Live SQL smoke tests are ignored by default. See [docs/testing.md](docs/testing.
 Review backlog and known correctness gaps are tracked in
 [docs/known-issues.md](docs/known-issues.md).
 
-License: `MIT OR 0BSD`.
-
 ## License
 
 0BSD. You can use, copy, modify, and distribute this project for almost any purpose.
