@@ -1,9 +1,9 @@
 <!-- i18n: language-switcher -->
 [English](testing.md) | [日本語](testing.ja.md)
 
-# Testing
+# テスト
 
-Default gate:
+デフォルトゲート：
 
 ```sh
 cargo fmt -- --check
@@ -12,13 +12,13 @@ cargo test --all-features
 cargo clippy --all-features --all-targets -- -D warnings
 ```
 
-Container SQL smoke tests:
+コンテナSQLスモークテスト：
 
 ```sh
 cargo test --test container_sql -- --ignored --test-threads=1
 ```
 
-Externally managed Postgres/MySQL smoke tests:
+外部管理のPostgres/MySQLスモークテスト：
 
 ```sh
 export IRODORI_POSTGRES_URL='postgres://postgres:postgres@127.0.0.1:5432/irodori_migration'
@@ -30,7 +30,7 @@ export IRODORI_MYSQL_DATABASE='irodori_migration'
 cargo test --test live_sql -- --ignored --test-threads=1
 ```
 
-Package check:
+パッケージチェック：
 
 ```sh
 rm -f Cargo.lock

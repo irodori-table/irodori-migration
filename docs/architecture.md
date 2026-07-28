@@ -1,3 +1,6 @@
+<!-- i18n: language-switcher -->
+[English](architecture.md) | [日本語](architecture.ja.md)
+
 # Architecture
 
 `irodori-migration` is an execution-free planning crate.
